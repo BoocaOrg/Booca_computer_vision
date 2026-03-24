@@ -1,93 +1,229 @@
-# Booca-computer-vision
+<a name="readme-top"></a>
+
+<!-- PROJECT LOGO -->
+<br />
+<div align="center">
+  <a href="https://github.com/janskn/football-computer-vision">
+    <img src="https://github.com/JanSkn/football-computer-vision/assets/68644413/9ba661d9-992a-499a-89f4-946d3a99a359" alt="Logo" width="200" height="200">
+  </a>
+
+  <h3 align="center">MatchVision</h3>
+
+  <p align="center">
+    Automated football match analysis using Computer Vision.
+    <br />
+    <a href="https://github.com/janskn/football-computer-vision/issues"><strong>Explore the docs »</strong></a>
+    <br />
+    <br />
+    <a href="https://github.com/janskn/football-computer-vision/issues">Report Bug</a>
+    ·
+    <a href="https://github.com/janskn/football-computer-vision/issues">Request Feature</a>
+  </p>
+
+  <br />
+
+</div>
 
 
 
-## Getting started
+<!-- ABOUT THE PROJECT -->
+## About The Project
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+The project called *MatchVision* allows tracking the ball, referees and players, treating players individually by ID and assigning them to a team, displaying ball possession and estimating the camera movement. 
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+<br />
 
-## Add your files
+**Training**
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+The model was trained on Google Colab's servers with T4 GPU (~ 45 mins.)
 
+It uses a custom trained YOLOv5 model.
+
+Benefits:
+- better ball tracking
+- not tracking persons outside the pitch
+
+<br />
+
+**Structure**
+
+The YOLO model detects the bounding boxes of the objects. They get stored in a dictionary along with the tracking ID, the team ID, the position etc.
+
+The team detection is based on KMeans clustering.
+
+To improve the ball highlighting, the ball position gets interpolated with Pandas.
+
+The camera movement gets estimated with optical flow to adjust the object positions.
+
+<br />
+
+**Input Video Example**
+
+<img width="1101" alt="image" src="https://github.com/user-attachments/assets/c922324f-f558-4d93-9833-97bfffdf4bc7">
+
+<br /><br />
+
+**Result**
+
+<img width="1101" alt="image" src="https://github.com/JanSkn/football-computer-vision/assets/68644413/09854bf6-39f5-4f7f-92c8-c8f438e7f7a1">
+
+
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+
+
+### Built With
+
+The source code was built with Python, mainly using Ultralytics, OpenCV and NumPy.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+
+
+### Requirements
+
+Requirements can be found under `requirements.txt`.
+
+```sh
+pip install -r requirements.txt
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/booca_sep490/booca-computer-vision.git
-git branch -M master
-git push -uf origin master
-```
 
-## Integrate with your tools
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-* [Set up project integrations](https://gitlab.com/booca_sep490/booca-computer-vision/-/settings/integrations)
 
-## Collaborate with your team
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
 
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
+<!-- USAGE EXAMPLES -->
 ## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+> __Warning__: Run all commands from the root of the project.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+You have **3 options** to run the project:
 
+<br />
+
+**1) Web Interface (Recommended) - NEW! ✨**
+
+Supports both **Offline** and **Realtime** analysis modes with multiple video sources:
+
+```sh
+streamlit run frontend/app.py
+```
+
+**Features:**
+- 📹 **Realtime Analysis**: Webcam, Phone Camera, URL Streams
+- 📁 **Drag & Drop Upload**: Support for MP4, AVI, MOV, MKV, FLV
+- 🌐 **Live Stream Analysis**: YouTube Live, Twitch, RTSP cameras
+- 📊 **Offline Processing**: Full video analysis with export
+- 🎨 **Customizable Visualization**: Toggle players, ball, referees, stats
+
+**Video Sources Supported:**
+- Webcam/Laptop camera
+- Phone camera (via IP Webcam/DroidCam apps)
+- Video file upload (drag & drop)
+- YouTube Live streams
+- Twitch streams
+- Direct stream URLs (HLS, RTSP, MP4)
+
+<br />
+
+**2) Command Line - Realtime Analysis**
+
+Process video in real-time from webcam, video file, or stream URL:
+
+| Argument | Description | Info |
+| ----------- | ----------- | ----------- |
+| source | Video source | '0' for webcam, path to video file, or URL |
+| tracks | Objects to visualize | Options: players, goalkeepers, referees, ball, stats |
+| verbose | Model output and logging | False if left out |
+
+Examples:
+```sh
+# Webcam
+python realtime_main.py --source 0 --tracks players ball referees stats
+
+# Video file
+python realtime_main.py --source demos/demo1.mp4 --tracks players ball stats
+
+# Phone camera (IP Webcam app)
+python realtime_main.py --source "http://192.168.1.5:8080/video" --tracks players ball
+
+# YouTube Live stream
+python realtime_main.py --source "https://youtube.com/watch?v=LIVE_VIDEO_ID" --tracks players ball
+```
+
+<br />
+
+**3) Command Line - Offline Processing**
+
+Process entire video and save output:
+
+| Argument | Description | Info |
+| ----------- | ----------- | ----------- |
+| video | Path to the input video | String |
+| tracks | Select what you want to highlight in the output video | Options: players, goalkeepers, referees, ball, stats |
+| verbose | Model output and logging | False if left out  |
+
+Example:
+```sh
+python main.py --video demos/demo1.mp4 --tracks players referees stats --verbose
+```
+
+<br />
+
+---
+
+### 📱 Using Phone as Camera
+
+1. Install **IP Webcam** (Android) or **DroidCam** app on your phone
+2. Connect phone and computer to the **same WiFi network**
+3. Note the IP address shown in the app (e.g., `192.168.1.5:8080`)
+4. Use the IP in the web interface or command line:
+   - Web: Select "URL Stream" and enter `http://192.168.1.5:8080/video`
+   - CLI: `python realtime_main.py --source "http://192.168.1.5:8080/video"`
+
+### 📺 Analyzing Live Streams
+
+Supports YouTube Live, Twitch, Facebook Live, and more via **streamlink**:
+
+```sh
+# Install streamlink (if not already installed)
+pip install streamlink
+
+# Analyze YouTube Live stream
+python realtime_main.py --source "https://youtube.com/watch?v=LIVE_VIDEO_ID"
+```
+
+In the web interface, simply paste the stream URL and click Start!
+
+---
+
+**📖 For detailed instructions, see [USAGE_GUIDE.md](USAGE_GUIDE.md)**
+
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+
+
+<!-- CONTRIBUTING -->
 ## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+If you have a suggestion that would make this better, please fork the repo and create a pull request. You can also simply open an issue with the tag "enhancement".
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+1. Fork the Project
+2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the Branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
+
+
+<!-- LICENSE -->
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Distributed under the MIT License. See `LICENSE` for more information.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
