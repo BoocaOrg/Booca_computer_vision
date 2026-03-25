@@ -32,18 +32,25 @@ class PlayerBallAssigner():
         ball_possession = []
 
         for frame_num, player in enumerate(tracks["players"]):
-            ball_bbox = tracks["ball"][frame_num][1]["bbox"]    # tracker_id 1
+            ball_frame = tracks["ball"][frame_num]
+            # Handle missing ball detection (KeyError guard)
+            if not ball_frame or 1 not in ball_frame:
+                if len(ball_possession) > 0:
+                    ball_possession.append(ball_possession[-1])
+                continue
+
+            ball_bbox = ball_frame[1]["bbox"]
             assigned_player = self.assign_ball_to_player(player, ball_bbox)
 
             if assigned_player != -1:
-                # add new key has_ball 
+                # add new key has_ball
                 tracks["players"][frame_num][assigned_player]["has_ball"] = True
-                ball_possession.append(tracks["players"][frame_num][assigned_player]["team"])    # current team in possesion in this frame
+                ball_possession.append(tracks["players"][frame_num][assigned_player]["team"])
             elif len(ball_possession) > 0:
-                ball_possession.append(ball_possession[-1])   # if ball not close to a player (e.g. pass played), last team in possesion
-            
+                ball_possession.append(ball_possession[-1])
+
         # ball possession counter in ball_possession_box() requires numpy array
-        ball_possession = np.array(ball_possession)
+        ball_possession = np.array(ball_possession) if ball_possession else np.array([])
 
         self.ball_possession = ball_possession
     

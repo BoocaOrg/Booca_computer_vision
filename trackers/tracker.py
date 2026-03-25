@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import List, Dict
 import time
 from datetime import datetime
@@ -25,11 +26,38 @@ class Tracker:
     Assigning bounding boxes unique IDs.
     Predicting and then tracking with supervision instead of YOLO tracking due to overwriting goalkeepers.
     """
-    def __init__(self, model_path: str, classes: List[int], verbose: bool=True) -> None: 
-        self.model = ultralytics.YOLO(model_path)
+    def __init__(self, model_path: str, classes: List[int], verbose: bool=True, fp16: bool=False, imgsz: int=640) -> None:
+        base_path = model_path.replace(".pt", "")
+        ext = os.path.splitext(model_path)[1]
+
+        # Priority: .engine (TensorRT) > .onnx > .pt (PyTorch)
+        if ext == ".engine" or os.path.exists(base_path + ".engine"):
+            model_file = base_path + ".engine" if ext != ".engine" else model_path
+            self.model = ultralytics.YOLO(model_file)
+            self.model_type = "tensorrt"
+            self.fp16 = False
+            if verbose:
+                print(f"[Tracker] Loaded TensorRT engine: {model_file}")
+        elif ext == ".onnx" or os.path.exists(base_path + ".onnx"):
+            model_file = base_path + ".onnx" if ext != ".onnx" else model_path
+            self.model = ultralytics.YOLO(model_file)
+            self.model_type = "onnx"
+            self.fp16 = False
+            if verbose:
+                print(f"[Tracker] Loaded ONNX model: {model_file}")
+        else:
+            self.model = ultralytics.YOLO(model_path)
+            self.model_type = "pytorch"
+            self.fp16 = fp16 and get_device() == "cuda"
+            if self.fp16:
+                self.model.half()
+            if verbose:
+                print(f"[Tracker] Loaded PyTorch model: {model_path} (fp16={self.fp16})")
+
         self.classes = classes
         self.tracker = sv.ByteTrack()
         self.verbose = verbose
+        self.imgsz = imgsz
         self.interpolation_tracker = None   # used for ball annotation: don't draw ball in a large interpolation window
 
     def interpolate_ball_positions(self, ball_tracks: List[Dict]) -> List[Dict]:
@@ -56,7 +84,6 @@ class Tracker:
         """
         List of frame predictions processed in batches to avoid memory issues.
         """
-        batch_size=batch_size
         detections = []
 
         
@@ -68,7 +95,7 @@ class Tracker:
         for i in range(0, len(frames), batch_size):
             frame_time = time.time()
             
-            detections_batch = self.model.predict(source=frames[i:i+batch_size], conf=0.15, verbose=self.verbose, device=get_device())
+            detections_batch = self.model.predict(source=frames[i:i+batch_size], conf=0.15, verbose=self.verbose, device=get_device(), imgsz=self.imgsz, half=self.fp16)
             detections += detections_batch
 
             if self.verbose:
@@ -214,7 +241,7 @@ class Tracker:
         Returns dict with format: {"players": {id: {"bbox": [...]}}, "referees": {...}, "ball": {...}}
         """
         # Detect objects in single frame
-        detection = self.model.predict(source=frame, conf=0.15, verbose=False, device=get_device())[0]
+        detection = self.model.predict(source=frame, conf=0.15, verbose=False, device=get_device(), imgsz=self.imgsz, half=self.fp16)[0]
         
         cls_names = detection.names
         cls_names_switched = {v: k for k, v in cls_names.items()}
@@ -251,8 +278,9 @@ class Tracker:
         for frame_detection in detection_supervision:
             bbox = frame_detection[0].tolist()
             cls_id = frame_detection[3]
-            
-            if cls_id == cls_names_switched["ball"]:
+            conf = frame_detection[2]
+
+            if cls_id == cls_names_switched["ball"] and conf >= 0.3:
                 tracks["ball"][1] = {"bbox": bbox}
                 break  # Only one ball
         

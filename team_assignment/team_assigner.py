@@ -6,6 +6,8 @@ class TeamAssigner:
     def __init__(self) -> None:
         self.team_colours = {}   # key: team_id (1 or 2), value: colour
         self.player_team_dict = {}      # key: player_id, value: team_id
+        self.frame_counter = 0
+        self.kmeans_throttle = 30  # run KMeans re-calibration every 30 frames
 
     def get_clusters(self, image: np.ndarray) -> KMeans:
         image_2d = image.reshape(-1, 3)
@@ -32,7 +34,11 @@ class TeamAssigner:
 
         return player_colour
 
-    def assign_team_colour(self, frame: np.ndarray, tracks: Dict[str, List[Dict]]) -> None:
+    def assign_team_colour(self, frame: np.ndarray, tracks: Dict[str, List[Dict]], force: bool = False) -> None:
+        # Only re-run KMeans every kmeans_throttle frames
+        if not force and self.frame_counter % self.kmeans_throttle != 0 and hasattr(self, 'kmeans') and self.kmeans is not None:
+            return
+
         player_colours = []
 
         # get shirt colour of the players in the frame
@@ -63,6 +69,7 @@ class TeamAssigner:
         self.team_colours[2] = kmeans.cluster_centers_[1]
 
     def get_player_team(self, frame: np.ndarray, bbox: List[float], player_id: int) -> int:
+        self.frame_counter += 1
         # assign each player a team
         if player_id in self.player_team_dict:
             return self.player_team_dict[player_id]

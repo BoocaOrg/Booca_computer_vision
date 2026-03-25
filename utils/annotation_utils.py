@@ -74,20 +74,35 @@ def triangle(frame: np.ndarray, bbox: List[float], colour: Tuple[int, int, int])
 
     return frame 
 
+# Running counters for O(1) ball possession calculation (reset per video)
+_team1_frames = 0
+_team2_frames = 0
+
 def ball_possession_box(frame_num: int, frame: np.ndarray, ball_possession: np.ndarray) -> np.ndarray:
+    global _team1_frames, _team2_frames
+
+    # Detect new video: ball_possession length shrinks (replay) or resets
+    # We detect a reset by checking if frame_num is 0 or if ball_possession is very short
+    if frame_num == 0:
+        _team1_frames = 0
+        _team2_frames = 0
+
     overlay = frame.copy()
 
     cv2.rectangle(overlay, pt1=(1350, 850), pt2=(1900, 970), color=(255, 255, 255), thickness=cv2.FILLED)
     alpha = 0.4
     cv2.addWeighted(src1=overlay, alpha=alpha, src2=frame, beta=1-alpha, gamma=0, dst=frame)
 
-    ball_possession_till_frame = ball_possession[:frame_num+1]
-    team_1_num_frames = ball_possession_till_frame[ball_possession_till_frame==1].shape[0]
-    team_2_num_frames = ball_possession_till_frame[ball_possession_till_frame==2].shape[0]
-    total = team_1_num_frames + team_2_num_frames
+    current_team = ball_possession[frame_num]
+    if current_team == 1:
+        _team1_frames += 1
+    elif current_team == 2:
+        _team2_frames += 1
 
-    team_1_possession = int(round(team_1_num_frames / total, 2) * 100)
-    team_2_possession = int(round(team_2_num_frames / total, 2) * 100)
+    total = _team1_frames + _team2_frames
+
+    team_1_possession = int(round(_team1_frames / total, 2) * 100)
+    team_2_possession = int(round(_team2_frames / total, 2) * 100)
 
     cv2.putText(frame, text=f"Team 1: {team_1_possession}%", org=(1400, 900), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, color=(0, 0, 0), thickness=3)
     cv2.putText(frame, text=f"Team 2: {team_2_possession}%", org=(1400, 950), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, color=(0, 0, 0), thickness=3)

@@ -28,10 +28,10 @@ class CameraMovementEstimator():
         )
 
         first_frame_grayscale = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # take top and bottom as orientation for the movement detection as there is not much change in the movement
+        # take left and right edges as orientation for the movement detection
         mask_features = np.zeros_like(first_frame_grayscale)
-        mask_features[:, 0:20] = 1
-        mask_features[:, frame.shape[0]-150:frame.shape[0]] = 1 
+        mask_features[:, 0:20] = 1  # left edge
+        mask_features[:, first_frame_grayscale.shape[1]-150:first_frame_grayscale.shape[1]] = 1  # right edge
 
         self.features = dict(
             maxCorners = 100,       # maximum number of corners (features) to be detected
@@ -43,9 +43,8 @@ class CameraMovementEstimator():
 
         self.classes = classes
         self.verbose = verbose
-        
+
         # State for realtime processing
-        first_frame_grayscale = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         self.old_gray = first_frame_grayscale
         self.old_features = cv2.goodFeaturesToTrack(first_frame_grayscale, **self.features)
 

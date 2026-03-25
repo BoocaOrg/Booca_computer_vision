@@ -8,12 +8,41 @@ from team_assignment import TeamAssigner
 from player_ball_assignment import PlayerBallAssigner
 from camera_movement import CameraMovementEstimator
 
-def process_video(data: Union[str, bytes], classes: List[int], verbose: bool=True) -> None:
-    frames, fps, _, _ = read_video(data, verbose)
+def _expand_tracks(tracks: dict, sampled_indices: list, total_frames: int) -> dict:
+    """Expand sampled tracks back to full frame count by holding last known values."""
+    expanded = {"players": [], "referees": [], "ball": []}
+    sample_ptr = 0
+    for i in range(total_frames):
+        if sample_ptr < len(sampled_indices) and i == sampled_indices[sample_ptr]:
+            expanded["players"].append(tracks["players"][sample_ptr])
+            expanded["referees"].append(tracks["referees"][sample_ptr])
+            expanded["ball"].append(tracks["ball"][sample_ptr])
+            sample_ptr += 1
+        else:
+            # Hold last known state for skipped frames
+            expanded["players"].append(expanded["players"][-1] if expanded["players"] else {})
+            expanded["referees"].append(expanded["referees"][-1] if expanded["referees"] else {})
+            expanded["ball"].append(expanded["ball"][-1] if expanded["ball"] else {})
+    return expanded
 
-    tracker = Tracker("models/best.pt", classes, verbose)
-    tracks = tracker.get_object_tracks(frames)
-    tracker.add_position_to_tracks(tracks)
+
+def process_video(data: Union[str, bytes], classes: List[int], verbose: bool=True, frame_skip: int=1, fp16: bool=False, imgsz: int=640, model_path: str="models/best.pt") -> None:
+    frames, fps, _, _ = read_video(data, verbose)
+    total_frames = len(frames)
+
+    tracker = Tracker(model_path, classes, verbose, fp16=fp16, imgsz=imgsz)
+
+    if frame_skip > 1:
+        sampled_indices = list(range(0, total_frames, frame_skip))
+        sampled_frames = frames[::frame_skip]
+        if verbose:
+            print(f"Frame skip: processing {len(sampled_frames)}/{total_frames} frames")
+        tracks = tracker.get_object_tracks(sampled_frames)
+        tracker.add_position_to_tracks(tracks)
+        tracks = _expand_tracks(tracks, sampled_indices, total_frames)
+    else:
+        tracks = tracker.get_object_tracks(frames)
+        tracker.add_position_to_tracks(tracks)
 
     camera_movement_estimator = CameraMovementEstimator(frames[0], classes, verbose)
     camera_movement_per_frame = camera_movement_estimator.get_camera_movement(frames)
@@ -60,11 +89,27 @@ if __name__ == "__main__":
     parser.add_argument("--video", type=str, help="Video path of the video (must be .mp4)")
     parser.add_argument("--tracks", nargs="+", type=str, help="Select the objects to visualise: players, goalkeepers, referees, ball")
     parser.add_argument("--verbose", action="store_true", help="Model output and logging")
+    parser.add_argument("--frame-skip", type=int, default=1, help="Process every Nth frame (1=all frames)")
+    parser.add_argument("--fp16", action="store_true", help="Enable FP16 half precision (CUDA only)")
+    parser.add_argument("--imgsz", type=int, default=640, help="YOLO input image size (416=fast, 640=balanced, 1280=accurate)")
+    parser.add_argument("--engine", action="store_true", help="Use TensorRT engine if available (models/best.engine)")
+    parser.add_argument("--onnx", action="store_true", help="Use ONNX model if available (models/best.onnx)")
+    parser.add_argument("--model", type=str, default="models/best.pt", help="Path to model file (.pt, .engine, .onnx)")
 
     args = parser.parse_args()
     
     if args.video and args.tracks:
         _video(args.video)
         classes = _classes(args.tracks)
-        
-        process_video(args.video, classes, args.verbose)
+
+        # Determine model path
+        if args.model != "models/best.pt":
+            model_path = args.model
+        elif args.engine and os.path.exists("models/best.engine"):
+            model_path = "models/best.engine"
+        elif args.onnx and os.path.exists("models/best.onnx"):
+            model_path = "models/best.onnx"
+        else:
+            model_path = "models/best.pt"
+
+        process_video(args.video, classes, args.verbose, args.frame_skip, args.fp16, args.imgsz, model_path=model_path)
