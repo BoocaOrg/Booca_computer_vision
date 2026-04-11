@@ -9,6 +9,7 @@ import ultralytics
 import supervision as sv
 from utils import ellipse, triangle, ball_possession_box, get_device, get_center_of_bbox, get_foot_position, options
 
+os.makedirs("logs", exist_ok=True)
 file_handler = logging.FileHandler("logs/tracking.log")
 file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 stream_handler = logging.StreamHandler()
@@ -80,7 +81,7 @@ class Tracker:
 
         return ball_positions
 
-    def detect_frames(self, frames: List[np.ndarray], batch_size: int=20) -> List[ultralytics.engine.results.Results]:
+    def detect_frames(self, frames: List[np.ndarray], batch_size: int=20) -> list:
         """
         List of frame predictions processed in batches to avoid memory issues.
         """
