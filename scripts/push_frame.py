@@ -71,11 +71,11 @@ class BroadcastPusher:
         # Enqueue locally for same-process consumers (e.g., MJPEG in same app)
         try:
             self._queue.put_nowait(frame.copy())
-        except queue.QueueFull:
+        except queue.Full:
             try:
                 self._queue.get_nowait()
                 self._queue.put_nowait(frame.copy())
-            except queue.QueueFull:
+            except queue.Full:
                 pass
 
         if not _HAS_REQUESTS:

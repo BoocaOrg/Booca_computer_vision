@@ -69,8 +69,16 @@
 - `realtime_main.py`: Added `--nvdec` CLI flag; `process_realtime()` accepts `nvdec` param and sets env var before VideoCapture; print statement updated to show nvdec status
 - `requirements.txt`: Added comment documenting NVDEC requirements (NVIDIA GPU + ffmpeg built with CUDA support; no new packages needed)
 
-## Tier 4b: Broadcast Integration (FULL IMPLEMENTATION)
+## Tier 4b: UI/UX + Broadcast (FULL IMPLEMENTATION)
 - Architecture: analysis loop → BroadcastPusher (HTTP POST) → broadcast_server.py (MJPEG + RTMP)
+- `frontend/app.py` UI improvements:
+  - Embedded MJPEG server thread on port 8503 serves frames to HTML iframe
+  - HTML iframe video player: native fullscreen support (F11 or browser button)
+  - Fullscreen button opens stream in new tab
+  - Layout restructured: header (status + fullscreen btn) → video iframe → sidebar zoom slider → debug area
+  - FPS counter in status bar
+  - Zoom applied before MJPEG encoding
+  - Removed all debug_expander wrapping (debug now simple inline)
 - `scripts/broadcast_server.py` (rewritten):
   - `BroadcastServer` class with `push_frame()` method
   - POST `/push` endpoint receives base64 JPEG frames from frontend/CLI
@@ -108,3 +116,26 @@
 - Frame counter increments in `get_player_team()`
 - File: `realtime_main.py`
 - Calibration call now uses `force=True` to ensure first frame always runs KMeans
+
+## Booca.online Livestream/VOD Integration (booca-stream)
+- File: `frontend/app.py`
+- Added `resolve_booca_url()` function: Resolves Booca URLs to direct m3u8 streams via Booca API
+  - API endpoint: `https://api.booca.online/api/streams/{stream_id}`
+  - Supports: `/livestream/watch/{id}` (live) and `/livestream/vod/{id}` (VOD)
+  - Live streams → `data.playbackUrls.hls` (HLS m3u8 from stream.booca.online)
+  - VOD recordings → `data.vod.url` (HLS m3u8 from Bunny CDN)
+  - Returns stream URL + metadata (title, status, category, user, stats, thumbnail)
+- **Realtime mode**: Added "Booca Stream" source type with dedicated UI
+  - Stream info card with theme support (dark/light) showing title, status badge, user, views/likes
+  - Thumbnail preview when available
+  - Duration info for VOD
+  - Auto-resolves URL via API and passes m3u8 to cv2.VideoCapture
+- **Offline mode**: Added "Booca VOD" source type
+  - Downloads all frames from HLS stream via cv2.VideoCapture
+  - Progress bar showing download progress
+  - Then feeds frames into existing offline analysis pipeline
+- **resolve_stream_url()**: Added Method 0a — Booca detection before other methods
+  - Detects `booca.online/livestream/` or `booca.vn/livestream/` URLs in generic URL input
+  - Falls through to other methods if Booca resolution fails
+- URL Stream documentation updated with Booca examples
+- Instructions section updated with Booca quick-start guide

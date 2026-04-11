@@ -111,11 +111,11 @@ class BroadcastServer:
         # Enqueue for MJPEG viewers
         try:
             self._queue.put_nowait(frame)
-        except queue.QueueFull:
+        except queue.Full:
             try:
                 self._queue.get_nowait()
                 self._queue.put_nowait(frame)
-            except queue.QueueFull:
+            except queue.Full:
                 pass
 
         # Push to RTMP

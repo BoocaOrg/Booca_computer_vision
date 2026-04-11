@@ -11,6 +11,9 @@ import base64
 # Add parent directory to path
 sys.path.append(os.path.abspath("."))
 
+import threading
+import queue
+
 from utils import options, read_video, save_video
 from trackers import Tracker
 from team_assignment import TeamAssigner
@@ -466,7 +469,7 @@ use_nvdec = st.sidebar.checkbox(
 st.sidebar.subheader("🔧 Advanced / CLI")
 use_fp16 = st.sidebar.checkbox(
     "Enable FP16 (CUDA only)",
-    value=False,
+    value=True,
     help="Enable half-precision inference. Requires NVIDIA GPU. ~2x throughput."
 )
 imgsz = st.sidebar.slider(
@@ -531,13 +534,129 @@ if analysis_mode == "Offline Processing":
     
     source_type = st.sidebar.selectbox(
         "Select Source",
-        ["Demo Video", "Upload Video"]
+        ["Demo Video", "Upload Video", "Booca VOD"]
     )
     
     video_data = None
     video_name = None
     
-    if source_type == "Demo Video":
+    if source_type == "Booca VOD":
+        st.sidebar.markdown("### 📹 Booca VOD Analysis")
+        
+        theme_mode = get_theme_mode()
+        is_dark = theme_mode == "dark"
+        
+        with st.sidebar.expander("ℹ️ How to use", expanded=False):
+            st.markdown("""
+            **Paste a Booca VOD URL to process the full recorded video:**
+            
+            📹 `https://booca.online/livestream/vod/{id}`
+            
+            The app will download and analyze the entire video offline.
+            """)
+        
+        booca_vod_input = st.sidebar.text_input(
+            "Booca VOD URL or Stream ID",
+            value="",
+            placeholder="https://booca.online/livestream/vod/...",
+            help="Paste the full Booca VOD URL or just the 24-character stream ID",
+            key="offline_booca_vod"
+        )
+        
+        if booca_vod_input:
+            import re as _re
+            import requests as _req
+            
+            _vod_url = booca_vod_input.strip()
+            _stream_id = None
+            
+            # Extract stream ID
+            _match = _re.search(r'booca\.(?:online|vn)/livestream/(?:watch|vod)/([a-f0-9]{24})', _vod_url)
+            if _match:
+                _stream_id = _match.group(1)
+            elif _re.match(r'^[a-f0-9]{24}$', _vod_url):
+                _stream_id = _vod_url
+            
+            if _stream_id:
+                try:
+                    _api_resp = _req.get(
+                        f"https://api.booca.online/api/streams/{_stream_id}",
+                        headers={
+                            'User-Agent': 'Mozilla/5.0',
+                            'Accept': 'application/json',
+                            'Origin': 'https://booca.online',
+                            'Referer': 'https://booca.online/'
+                        },
+                        timeout=10
+                    )
+                    _api_data = _api_resp.json()
+                    
+                    if _api_data.get('success'):
+                        _sd = _api_data['data']
+                        _vod_info = _sd.get('vod', {})
+                        _title = _sd.get('title', 'Unknown')
+                        _status = _sd.get('status', 'unknown')
+                        _user = _sd.get('userId', {})
+                        _stats = _sd.get('stats', {})
+                        _category = _sd.get('category', '')
+                        _thumbnail = _sd.get('thumbnail', '') or _vod_info.get('thumbnailUrl', '')
+                        
+                        _status_badge = "📹 VOD" if _status == 'vod_ready' else f"⚪ {_status}"
+                        _user_name = f"{_user.get('lastName', '')} {_user.get('firstName', '')}".strip()
+                        
+                        # Stream info card with theme support
+                        card_bg = "#1e293b" if is_dark else "#f1f5f9"
+                        card_border = "#334155" if is_dark else "#e2e8f0"
+                        card_text = "#e2e8f0" if is_dark else "#1e293b"
+                        accent = "#00e0ca"
+                        
+                        st.sidebar.markdown(f"""
+                        <div style="background:{card_bg}; border:1px solid {card_border}; border-radius:10px; padding:12px; margin:8px 0;">
+                            <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+                                <span style="background:#3b82f6; color:white; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:600;">{_status_badge}</span>
+                                <span style="color:{accent}; font-size:12px;">⚽ {_category}</span>
+                            </div>
+                            <div style="color:{card_text}; font-size:14px; font-weight:600; margin-bottom:6px; line-height:1.3;">{_title[:80]}</div>
+                            <div style="color:#94a3b8; font-size:12px;">👤 {_user_name}</div>
+                            <div style="color:#94a3b8; font-size:11px; margin-top:4px;">👁 {_stats.get('totalViews', 0)} views · ❤️ {_stats.get('likes', 0)} likes</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        if _thumbnail:
+                            try:
+                                st.sidebar.image(_thumbnail, use_container_width=True)
+                            except Exception:
+                                pass
+                        
+                        _duration = _vod_info.get('duration', 0)
+                        if _duration > 0:
+                            st.sidebar.info(f"⏱️ Duration: {_duration // 60}m {_duration % 60}s")
+                        
+                        # Get VOD m3u8 URL
+                        _m3u8_url = _vod_info.get('url', '') or _sd.get('playbackUrls', {}).get('hls', '')
+                        
+                        if _m3u8_url and _status == 'vod_ready':
+                            st.sidebar.success(f"✅ VOD ready for analysis")
+                            st.sidebar.caption(f"🔗 {_m3u8_url[:60]}...")
+                            
+                            # Download VOD via cv2 and convert to frames
+                            # We store the URL; read_video can't handle m3u8,
+                            # so we download via cv2 into a temp file
+                            st.session_state['booca_vod_url'] = _m3u8_url
+                            st.session_state['booca_vod_title'] = _title
+                            video_name = _title
+                        elif _status == 'live':
+                            st.sidebar.warning("⚠️ This stream is currently LIVE. Use **Realtime Analysis** mode instead.")
+                        else:
+                            st.sidebar.warning(f"⚠️ VOD not ready yet (status: {_status})")
+                    else:
+                        st.sidebar.error("❌ Stream not found")
+                except Exception as e:
+                    st.sidebar.error(f"❌ Error: {str(e)[:60]}")
+            else:
+                st.sidebar.error("❌ Invalid Booca URL format")
+    
+    elif source_type == "Demo Video":
         demo_videos = {
             "Demo 1": "demos/demo1.mp4",
             "Demo 2": "demos/demo2.mp4"
@@ -581,13 +700,62 @@ if analysis_mode == "Offline Processing":
             video_data = uploaded_file.read()
             video_name = uploaded_file.name
     
-    # Process Button
-    if video_data:
+    # Process Button — support regular video_data or Booca VOD URL
+    _booca_vod_url = st.session_state.get('booca_vod_url', '')
+    _can_process = video_data is not None or bool(_booca_vod_url)
+    
+    if _can_process:
         if st.sidebar.button("🚀 Start Analysis", type="primary", use_container_width=True):
             with st.spinner("🔄 Processing video... This may take several minutes."):
                 try:
-                    # Process video
-                    frames, fps, _, _ = read_video(video_data, verbose=False)
+                    if video_data:
+                        # Regular video file — use read_video
+                        frames, fps, _, _ = read_video(video_data, verbose=False)
+                    elif _booca_vod_url:
+                        # Booca VOD — download frames via cv2.VideoCapture from HLS
+                        st.info(f"📥 Downloading Booca VOD: {st.session_state.get('booca_vod_title', 'Unknown')}")
+                        _cap = cv2.VideoCapture(_booca_vod_url, cv2.CAP_FFMPEG)
+                        if not _cap.isOpened():
+                            # Try with Booca referer
+                            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                                "protocol_whitelist;file,http,https,tcp,tls,crypto"
+                                "|headers;User-Agent: Mozilla/5.0\\r\\n"
+                                "Referer: https://booca.online/\\r\\n"
+                                "Origin: https://booca.online"
+                            )
+                            _cap = cv2.VideoCapture(_booca_vod_url, cv2.CAP_FFMPEG)
+                        
+                        if not _cap.isOpened():
+                            raise RuntimeError(f"Cannot open VOD stream: {_booca_vod_url[:60]}")
+                        
+                        fps = _cap.get(cv2.CAP_PROP_FPS) or 30.0
+                        frames = []
+                        _dl_progress = st.progress(0, text="Downloading VOD frames...")
+                        _total_frames = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+                        _frame_idx = 0
+                        
+                        while True:
+                            ret, frame = _cap.read()
+                            if not ret:
+                                break
+                            frames.append(frame)
+                            _frame_idx += 1
+                            if _total_frames > 0 and _frame_idx % 30 == 0:
+                                _dl_progress.progress(
+                                    min(_frame_idx / _total_frames, 0.99),
+                                    text=f"Downloaded {_frame_idx}/{_total_frames} frames..."
+                                )
+                        
+                        _cap.release()
+                        _dl_progress.progress(1.0, text=f"Downloaded {len(frames)} frames")
+                        
+                        if len(frames) == 0:
+                            raise RuntimeError("No frames downloaded from VOD")
+                        
+                        # Clear the stored URL
+                        st.session_state.pop('booca_vod_url', None)
+                    else:
+                        raise RuntimeError("No video source available")
                     
                     progress_bar = st.progress(0, text="Initializing models...")
                     
@@ -654,7 +822,7 @@ else:  # Realtime Analysis
     
     source_type = st.sidebar.selectbox(
         "Select Source",
-        ["Webcam", "Video File", "URL Stream"]
+        ["Booca Stream", "Webcam", "Video File", "URL Stream"]
     )
     
     source_path = None
@@ -668,6 +836,108 @@ else:  # Realtime Analysis
                 available_indices.append(i)
                 cap.release()
         return available_indices
+    
+    def resolve_booca_url(url):
+        """
+        Resolve Booca livestream/VOD URL to direct m3u8 stream.
+        Supports:
+          - https://booca.online/livestream/watch/{id}  (live)
+          - https://booca.online/livestream/vod/{id}    (recorded)
+          - Direct stream ID (just the hex id)
+        Returns: (stream_url, stream_info_dict) or (None, error_msg)
+        """
+        import re
+        import requests as req
+        
+        url = url.strip()
+        
+        # Extract stream ID from URL
+        stream_id = None
+        is_vod = False
+        
+        # Pattern: /livestream/watch/{id} or /livestream/vod/{id}
+        match = re.search(r'booca\.(?:online|vn)/livestream/(?:watch|vod)/([a-f0-9]{24})', url)
+        if match:
+            stream_id = match.group(1)
+            is_vod = '/vod/' in url
+        # Pattern: just a 24-char hex ID
+        elif re.match(r'^[a-f0-9]{24}$', url):
+            stream_id = url
+        
+        if not stream_id:
+            return None, "Invalid Booca URL. Use format: https://booca.online/livestream/watch/{id} or /vod/{id}"
+        
+        # Call Booca API
+        api_url = f"https://api.booca.online/api/streams/{stream_id}"
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json',
+                'Origin': 'https://booca.online',
+                'Referer': 'https://booca.online/'
+            }
+            resp = req.get(api_url, headers=headers, timeout=10)
+            data = resp.json()
+            
+            if not data.get('success'):
+                return None, f"API error: stream not found (ID: {stream_id})"
+            
+            stream_data = data['data']
+            status = stream_data.get('status', 'unknown')
+            title = stream_data.get('title', 'Unknown')
+            category = stream_data.get('category', '')
+            playback = stream_data.get('playbackUrls', {})
+            vod_info = stream_data.get('vod', {})
+            
+            info = {
+                'id': stream_id,
+                'title': title,
+                'status': status,
+                'category': category,
+                'is_live': status == 'live',
+                'is_vod': status == 'vod_ready',
+                'is_ended': status == 'ended',
+                'user': stream_data.get('userId', {}),
+                'stats': stream_data.get('stats', {}),
+                'thumbnail': stream_data.get('thumbnail', '') or vod_info.get('thumbnailUrl', ''),
+            }
+            
+            # For VOD-ready streams, prefer the VOD CDN URL
+            if status == 'vod_ready' and vod_info.get('url'):
+                info['duration'] = vod_info.get('duration', 0)
+                return vod_info['url'], info
+            
+            # For ended streams, check if VOD is available or being processed
+            if status == 'ended':
+                vod_status = vod_info.get('status', '')
+                if vod_info.get('url') and vod_status == 'ready':
+                    # VOD is ready even though status says ended
+                    info['is_vod'] = True
+                    info['duration'] = vod_info.get('duration', 0)
+                    return vod_info['url'], info
+                elif vod_status == 'pending':
+                    return None, f"Stream đã kết thúc. VOD đang được xử lý, vui lòng thử lại sau vài phút."
+                else:
+                    return None, f"Stream đã kết thúc và không có bản ghi VOD. (status: ended, vod: {vod_status or 'none'})"
+            
+            # For live streams, use HLS playback URL
+            if status == 'live' and playback.get('hls'):
+                return playback['hls'], info
+            
+            # Fallback to FLV for live streams
+            if status == 'live' and playback.get('flv'):
+                return playback['flv'], info
+            
+            # For other statuses (idle, etc.)
+            if playback.get('hls'):
+                return playback['hls'], info
+            
+            return None, f"Không có URL phát (status: {status})"
+            
+        except req.exceptions.RequestException as e:
+            return None, f"Network error: {str(e)[:60]}"
+        except Exception as e:
+            return None, f"Error: {str(e)[:60]}"
     
     def resolve_stream_url(url):
         """
@@ -687,7 +957,20 @@ else:  # Realtime Analysis
             st.sidebar.info(f"ℹ️ Using direct URL")
             return url
         
-        # Method 0: Extract m3u8 from embed player pages (rkplayer, cakhia, etc.)
+        # Method 0a: Booca.online livestream/VOD
+        if 'booca.online/livestream/' in url or 'booca.vn/livestream/' in url:
+            st.sidebar.text("🔍 Resolving Booca stream...")
+            stream_url, info = resolve_booca_url(url)
+            if stream_url:
+                if isinstance(info, dict):
+                    status_emoji = "🔴" if info.get('is_live') else "📹"
+                    st.sidebar.success(f"{status_emoji} {info.get('title', '')[:50]}")
+                    st.session_state['booca_stream_info'] = info
+                return stream_url
+            else:
+                st.sidebar.warning(f"⚠️ Booca: {info}")
+        
+        # Method 0b: Extract m3u8 from embed player pages (rkplayer, cakhia, etc.)
         player_domains = ["rkplayer", "cakhia", "xoilac", "vebo", "socolive", "xem"]
         if any(domain in url for domain in player_domains):
             try:
@@ -893,6 +1176,89 @@ else:  # Realtime Analysis
             with st.sidebar.expander("🎬 Preview"):
                 st.video(uploaded_file)
     
+    elif source_type == "Booca Stream":
+        st.sidebar.markdown("### 🟢 Booca Livestream / VOD")
+        
+        theme_mode = get_theme_mode()
+        is_dark = theme_mode == "dark"
+        
+        with st.sidebar.expander("ℹ️ How to use", expanded=False):
+            st.markdown("""
+            **Paste a Booca livestream or VOD URL:**
+            
+            🔴 **Live:** `https://booca.online/livestream/watch/{id}`
+            📹 **VOD:** `https://booca.online/livestream/vod/{id}`
+            
+            The app will automatically extract the stream URL via Booca API.
+            """)
+        
+        booca_url_input = st.sidebar.text_input(
+            "Booca URL or Stream ID",
+            value="",
+            placeholder="https://booca.online/livestream/watch/...",
+            help="Paste the full Booca URL or just the 24-character stream ID"
+        )
+        
+        if booca_url_input:
+            with st.sidebar.spinner("Resolving Booca stream..."):
+                stream_url, info = resolve_booca_url(booca_url_input)
+            
+            if stream_url and isinstance(info, dict):
+                # Show stream info card
+                status = info.get('status', 'unknown')
+                is_live = info.get('is_live', False)
+                title = info.get('title', 'Unknown')
+                category = info.get('category', '')
+                user_data = info.get('user', {})
+                stats = info.get('stats', {})
+                thumbnail = info.get('thumbnail', '')
+                
+                status_badge = "🔴 LIVE" if is_live else "📹 VOD" if info.get('is_vod') else f"⚪ {status}"
+                user_name = f"{user_data.get('lastName', '')} {user_data.get('firstName', '')}".strip()
+                
+                # Stream info card with theme support
+                card_bg = "#1e293b" if is_dark else "#f1f5f9"
+                card_border = "#334155" if is_dark else "#e2e8f0"
+                card_text = "#e2e8f0" if is_dark else "#1e293b"
+                accent = "#00e0ca"
+                live_color = "#ef4444" if is_live else "#3b82f6"
+                
+                st.sidebar.markdown(f"""
+                <div style="background:{card_bg}; border:1px solid {card_border}; border-radius:10px; padding:12px; margin:8px 0;">
+                    <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+                        <span style="background:{live_color}; color:white; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:600;">{status_badge}</span>
+                        <span style="color:{accent}; font-size:12px;">⚽ {category}</span>
+                    </div>
+                    <div style="color:{card_text}; font-size:14px; font-weight:600; margin-bottom:6px; line-height:1.3;">{title[:80]}</div>
+                    <div style="color:#94a3b8; font-size:12px;">👤 {user_name}</div>
+                    <div style="color:#94a3b8; font-size:11px; margin-top:4px;">👁 {stats.get('totalViews', 0)} views · ❤️ {stats.get('likes', 0)} likes</div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                if thumbnail:
+                    try:
+                        st.sidebar.image(thumbnail, use_container_width=True)
+                    except Exception:
+                        pass
+                
+                # Show resolved URL (truncated)
+                st.sidebar.caption(f"🔗 {stream_url[:60]}...")
+                
+                source_path = stream_url
+                st.session_state['booca_stream_info'] = info
+                st.session_state['stream_referer'] = 'https://booca.online/'
+                
+                if not is_live and info.get('is_vod'):
+                    duration = info.get('duration', 0)
+                    if duration > 0:
+                        mins = duration // 60
+                        secs = duration % 60
+                        st.sidebar.info(f"⏱️ Duration: {mins}m {secs}s")
+                    st.sidebar.info("💡 Tip: For VOD, you can also use **Offline Processing** mode for full video analysis.")
+            elif stream_url is None:
+                error_msg = info if isinstance(info, str) else "Unknown error"
+                st.sidebar.error(f"❌ {error_msg}")
+    
     elif source_type == "URL Stream":
         st.sidebar.markdown("### 🌐 Stream URL")
         
@@ -902,9 +1268,12 @@ else:  # Realtime Analysis
             - YouTube Live
             - Twitch
             - Facebook Live
+            - Booca.online (Live & VOD)
             - Direct streams (HLS, RTSP, MP4)
             
             **Examples:**
+            - Booca Live: `https://booca.online/livestream/watch/{id}`
+            - Booca VOD: `https://booca.online/livestream/vod/{id}`
             - YouTube: `https://youtube.com/watch?v=...`
             - Twitch: `https://twitch.tv/channel_name`
             - Phone cam: `http://192.168.1.5:8080/video`
@@ -914,7 +1283,7 @@ else:  # Realtime Analysis
         url_input = st.sidebar.text_input(
             "Enter Stream URL",
             value="http://192.168.1.5:8080/video",
-            help="Enter direct stream URL or webpage URL (YouTube, Twitch, etc.)"
+            help="Enter direct stream URL or webpage URL (YouTube, Twitch, Booca, etc.)"
         )
         
         if url_input:
@@ -944,291 +1313,169 @@ else:  # Realtime Analysis
     
     # Main content area
     if st.session_state.analysis_running and source_path is not None:
-        # Zoom controls for realtime mode
-        zoom_col1, zoom_col2, zoom_col3 = st.columns([1, 2, 1])
-        with zoom_col2:
-            rt_zoom = st.slider(
-                "🔍 Zoom Level",
-                min_value=1.0, max_value=3.0, value=1.0, step=0.25,
-                key="rt_zoom_level",
-                help="Zoom into the video frame. 1x = normal, 3x = maximum zoom"
-            )
-        
-        st_frame = st.empty()
-        st_status = st.empty()
-        st_debug = st.empty()  # Debug area
-
-        # Initialize broadcast pusher (non-blocking HTTP POST)
+        # Broadcast pusher init
         pusher = None
         if enable_broadcast and _HAS_PUSHER:
             try:
                 pusher = BroadcastPusher("http://localhost:8502", enabled=True)
-            except Exception as e:
-                st.sidebar.warning(f"Broadcast init failed: {e}")
+            except Exception:
+                pass
 
-        # Broadcast status display
-        if enable_broadcast:
-            st_bc = st.sidebar.container()
-            st_bc.info("📡 **Broadcast Active** — Open: http://localhost:8502/mjpeg")
-            if broadcast_url:
-                st_bc.caption(f"RTMP: {broadcast_url[:50]}...")
-            else:
-                st_bc.caption("MJPEG only (no RTMP)")
+        # Header row: status + fullscreen
+        h_col1, h_col2 = st.columns([5, 1])
+        with h_col1:
+            st_status = st.empty()
+            st_status.info("🔄 Initializing models...")
+        with h_col2:
+            st.markdown('<a href="http://localhost:8502/mjpeg" target="_blank"><button style="background:#262730;color:#fff;border:none;border-radius:6px;padding:6px 16px;cursor:pointer;width:100%">⛶ Fullscreen</button></a>', unsafe_allow_html=True)
 
-        st_status.info("🔄 Initializing models...")
-        
-        # Debug expander
-        debug_expander = st.expander("🔧 Debug Info", expanded=True)
-        
+        # Video display — st.image() shows frames directly
+        st_frame = st.empty()
+
+        # Sidebar controls
+        rt_zoom = st.sidebar.slider("Zoom", 1.0, 3.0, 1.0, 0.25, key="rt_zoom_level")
+        st_debug_area = st.empty()
+
         try:
-            # For HLS streams that require headers, use ffmpeg options
             cap = None
-
-            # Enable NVDEC hardware decode for NVIDIA GPUs (set before any VideoCapture)
-            # Note: m3u8 referer setting below will override this for HLS streams
-            if use_nvdec:
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "hwaccel;cuda|video_codec;h264_cuvid"
-
-            # Get stored referer if available
+            _is_booca = isinstance(source_path, str) and (
+                "stream.booca.online" in source_path or
+                "b-cdn.net" in source_path or
+                st.session_state.get('booca_stream_info') is not None
+            )
             stream_referer = st.session_state.get('stream_referer', 'https://watch.rkplayer.xyz/')
             original_url = st.session_state.get('original_player_url', '')
-            
-            with debug_expander:
-                st.write(f"**Source URL:** `{source_path[:100]}...`" if len(str(source_path)) > 100 else f"**Source URL:** `{source_path}`")
-                st.write(f"**Is m3u8:** {'.m3u8' in str(source_path)}")
-                st.write(f"**Referer:** `{stream_referer}`")
-            
-            if isinstance(source_path, str) and ".m3u8" in source_path:
-                with debug_expander:
-                    st.write("**Method 1:** Trying ffmpeg with headers...")
-                
-                # Try with ffmpeg and proper options for HLS - use stored referer
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"protocol_whitelist;file,http,https,tcp,tls,crypto|headers;User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\nReferer: {stream_referer}\r\nOrigin: {stream_referer}"
-                cap = cv2.VideoCapture(source_path, cv2.CAP_FFMPEG)
-                
-                with debug_expander:
-                    st.write(f"  → Result: {'✅ Opened' if cap.isOpened() else '❌ Failed'}")
-                
-                if not cap.isOpened():
-                    # Alternative: try with streamlink as middleman
-                    with debug_expander:
-                        st.write("**Method 2:** Trying streamlink...")
-                    try:
-                        import streamlink
-                        streams = streamlink.streams(source_path)
-                        with debug_expander:
-                            st.write(f"  → Available streams: {list(streams.keys()) if streams else 'None'}")
-                        if streams:
-                            # Try different qualities
-                            for quality in ["best", "worst", "720p", "480p"]:
-                                if quality in streams:
-                                    best_url = streams[quality].url
-                                    with debug_expander:
-                                        st.write(f"  → Trying quality: {quality}")
-                                        st.write(f"  → Stream URL: `{best_url[:80]}...`")
-                                    cap = cv2.VideoCapture(best_url, cv2.CAP_FFMPEG)
-                                    if cap.isOpened():
-                                        with debug_expander:
-                                            st.write(f"  → ✅ Success with {quality}")
-                                        break
-                    except Exception as e:
-                        with debug_expander:
-                            st.write(f"  → ❌ Streamlink error: {str(e)}")
-                
-                if not cap or not cap.isOpened():
-                    # Method 3: Direct without headers
-                    with debug_expander:
-                        st.write("**Method 3:** Trying direct connection...")
-                    cap = cv2.VideoCapture(source_path)
-                    with debug_expander:
-                        st.write(f"  → Result: {'✅ Opened' if cap.isOpened() else '❌ Failed'}")
-            elif isinstance(source_path, str) and "fbcdn.net" in source_path:
-                # Facebook CDN URLs require User-Agent headers
-                with debug_expander:
-                    st.write("**Method:** Facebook CDN with headers...")
-                
-                fb_ffmpeg_opts = (
-                    "headers;User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\\r\\n"
+
+            # Booca streams: set correct headers before first attempt
+            if _is_booca and isinstance(source_path, str) and ".m3u8" in source_path:
+                _booca_ffmpeg_opts = (
+                    "protocol_whitelist;file,http,https,tcp,tls,crypto"
+                    "|headers;User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
+                    "Referer: https://booca.online/\r\n"
+                    "Origin: https://booca.online"
                     "|reconnect;1|reconnect_streamed;1|reconnect_delay_max;5"
+                    "|rw_timeout;15000000"
                 )
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = fb_ffmpeg_opts
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = _booca_ffmpeg_opts
+                st_status.info("🔄 Connecting to Booca stream...")
                 cap = cv2.VideoCapture(source_path, cv2.CAP_FFMPEG)
                 
-                with debug_expander:
-                    st.write(f"  → Result: {'✅ Opened' if cap.isOpened() else '❌ Failed'}")
-                
-                # Fallback: Use yt-dlp to pipe video through ffmpeg
+                # Retry without reconnect params
                 if not cap.isOpened():
-                    with debug_expander:
-                        st.write("**Method 2:** yt-dlp pipe fallback...")
-                    try:
-                        import subprocess
-                        # Get the original Facebook URL from session state
-                        original_fb_url = st.session_state.get('resolved_from_url', '')
-                        if not original_fb_url:
-                            original_fb_url = source_path
-                        
-                        # Use yt-dlp to stream to stdout, pipe to ffmpeg/OpenCV
-                        yt_dlp_cmd = [
-                            sys.executable, "-m", "yt_dlp",
-                            "-o", "-",  # Output to stdout
-                            "--quiet",
-                            original_fb_url
-                        ]
-                        
-                        pipe = subprocess.Popen(
-                            yt_dlp_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE
-                        )
-                        
-                        # Create temp file from yt-dlp output (first few MB for testing)
-                        import tempfile
-                        temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                        temp_path = temp_video.name
-                        st.session_state['temp_fb_video'] = temp_path
-                        
-                        # Read first chunk to verify stream works
-                        chunk = pipe.stdout.read(1024 * 1024)  # 1MB
-                        if chunk:
-                            temp_video.write(chunk)
-                            # Continue reading in background - write all remaining data
-                            remaining = pipe.stdout.read()
-                            temp_video.write(remaining)
-                            temp_video.close()
-                            pipe.wait()
-                            
-                            cap = cv2.VideoCapture(temp_path, cv2.CAP_FFMPEG)
-                            with debug_expander:
-                                st.write(f"  → yt-dlp pipe result: {'✅ Opened' if cap.isOpened() else '❌ Failed'}")
-                        else:
-                            temp_video.close()
-                            pipe.kill()
-                            with debug_expander:
-                                st.write("  → ❌ yt-dlp pipe: no data received")
-                    except Exception as e:
-                        with debug_expander:
-                            st.write(f"  → ❌ yt-dlp pipe failed: {str(e)[:80]}")
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                        "protocol_whitelist;file,http,https,tcp,tls,crypto"
+                        "|headers;User-Agent: Mozilla/5.0\r\n"
+                        "Referer: https://booca.online/\r\n"
+                        "Origin: https://booca.online"
+                    )
+                    cap = cv2.VideoCapture(source_path, cv2.CAP_FFMPEG)
             else:
-                # Normal capture for non-HLS, non-Facebook sources
-                with debug_expander:
-                    st.write("**Method:** Standard ffmpeg capture...")
+                if use_nvdec:
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "hwaccel;cuda|video_codec;h264_cuvid"
+
                 cap = cv2.VideoCapture(source_path, cv2.CAP_FFMPEG)
-                with debug_expander:
-                    st.write(f"  → Result: {'✅ Opened' if cap.isOpened() else '❌ Failed'}")
+                if not cap.isOpened() and isinstance(source_path, str) and ".m3u8" in source_path:
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"protocol_whitelist;file,http,https,tcp,tls,crypto|headers;User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\nReferer: {stream_referer}\r\nOrigin: {stream_referer}"
+                    cap = cv2.VideoCapture(source_path, cv2.CAP_FFMPEG)
+                if not cap.isOpened() and isinstance(source_path, str) and "fbcdn.net" in source_path:
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                        "headers;User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
+                        "|reconnect;1|reconnect_streamed;1|reconnect_delay_max;5"
+                    )
+                    cap = cv2.VideoCapture(source_path, cv2.CAP_FFMPEG)
             
-            # If failed, try default backend
-            if cap is None or not cap.isOpened():
-                with debug_expander:
-                    st.write("**Fallback:** Trying default backend...")
+            if not cap.isOpened():
                 cap = cv2.VideoCapture(source_path)
-                with debug_expander:
-                    st.write(f"  → Result: {'✅ Opened' if cap.isOpened() else '❌ Failed'}")
-            
-            # Set parameters for network streams
+
             if isinstance(source_path, str) and (source_path.startswith("http") or source_path.startswith("rtsp")):
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 60000)
                 cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 60000)
-            
+
             if not cap.isOpened():
-                st.error(f"❌ Cannot open video source")
-                with st.expander("🔍 Troubleshooting Help"):
-                    st.markdown(f"""
-                    **Failed to open:** `{source_path[:100]}...`
-                    
-                    **Possible solutions:**
-                    1. **For .m3u8 streams**: Install ffmpeg: `pip install ffmpeg-python`
-                    2. **For protected streams**: May need authentication or cookies
-                    3. **Try yt-dlp**: Install with `pip install yt-dlp` for better support
-                    4. **Check URL**: Verify the stream is currently live/accessible
-                    5. **Network**: Check firewall/proxy settings
-                    
-                    **Alternative methods:**
-                    - Extract direct .m3u8/.mp4 URL using browser dev tools (Network tab)
-                    - Use VLC to test the URL first
-                    - Try a different stream quality/format
-                    """)
-            else:
-                ret, frame = cap.read()
-                if not ret:
-                    st.error("❌ Cannot read from video source")
+                st_error = st_debug_area.empty()
+                if _is_booca:
+                    _booca_info = st.session_state.get('booca_stream_info', {})
+                    _stream_status = _booca_info.get('status', 'unknown')
+                    if _stream_status not in ('live', 'vod_ready'):
+                        st_error.error(f"❌ Cannot open — stream status is **{_stream_status}**. Only 🔴 LIVE or 📹 VOD (recorded) streams work in realtime.")
+                    else:
+                        st_error.error(f"❌ Cannot connect to Booca stream. Check network or try again.")
                 else:
-                    # Apply resolution scaling to first frame (must be done before initializing models)
+                    st_error.error(f"Cannot open: {source_path[:80]}")
+            else:
+                # Read initial frame — skip up to 30 corrupt frames (common with HLS mid-join)
+                ret = False
+                frame = None
+                for _init_attempt in range(30):
+                    ret, frame = cap.read()
+                    if ret and frame is not None and frame.size > 0:
+                        break
+                
+                if not ret or frame is None:
+                    st_debug_area.error("Cannot read from source")
+                else:
                     if resolution_scale < 1.0:
                         h, w = frame.shape[:2]
                         new_w, new_h = int(w * resolution_scale), int(h * resolution_scale)
                         frame = cv2.resize(frame, (new_w, new_h))
-                    
-                    # Initialize models
+
                     tracker = Tracker(model_path, class_ids, verbose=False, fp16=use_fp16, imgsz=imgsz)
                     camera_movement_estimator = CameraMovementEstimator(frame, class_ids, verbose=False)
                     team_assigner = TeamAssigner()
                     player_assigner = PlayerBallAssigner()
-                    
                     teams_assigned = False
                     frame_count = 0
-                    
+                    _fps_start = time.time()
+
                     st_status.success("✅ Processing... Press Stop to end")
-                    
+
                     while cap.isOpened():
                         if not st.session_state.analysis_running:
                             break
-                        
                         ret, frame = cap.read()
                         if not ret:
-                            st.warning("⚠️ Stream ended")
+                            st_debug_area.warning("Stream ended")
                             break
-                        
+                        # Skip corrupt/empty frames from H264 decode errors
+                        if frame is None or frame.size == 0:
+                            continue
                         frame_count += 1
-                        
-                        # Frame skip for performance
                         if frame_count % frame_skip != 0:
                             continue
-                        
-                        # Resolution scaling for performance
                         if resolution_scale < 1.0:
                             h, w = frame.shape[:2]
                             new_w, new_h = int(w * resolution_scale), int(h * resolution_scale)
                             frame = cv2.resize(frame, (new_w, new_h))
-                        
-                        # Process frame
                         tracks = tracker.get_object_tracks_single_frame(frame)
                         tracker.add_position_to_tracks_single_frame(tracks)
-                        
                         camera_movement = camera_movement_estimator.get_camera_movement_single_frame(frame)
                         camera_movement_estimator.adjust_positions_to_tracks_single_frame(tracks, camera_movement)
-                        
-                        # Team assignment
                         players_in_frame = tracks.get("players", {})
                         if not teams_assigned and len(players_in_frame) > 0:
                             team_assigner.assign_team_colour(frame, players_in_frame, force=True)
                             teams_assigned = True
-                        
                         if teams_assigned:
                             for player_id, player_track in players_in_frame.items():
                                 team = team_assigner.get_player_team(frame, player_track["bbox"], player_id)
                                 tracks["players"][player_id]["team"] = team
                                 tracks["players"][player_id]["team_colour"] = team_assigner.team_colours[team]
-                        
-                        # Ball assignment
                         player_assigner.assign_ball_single_frame(tracks)
-                        
-                        # Draw annotations
                         if player_assigner.ball_possession:
                             sanitized_possession = [-1 if x is None else x for x in player_assigner.ball_possession]
                             ball_possession_np = np.array(sanitized_possession)
                         else:
                             ball_possession_np = None
-                        
                         output_frame = tracker.draw_annotations_single_frame(frame, tracks, ball_possession_np)
                         output_frame = camera_movement_estimator.draw_camera_movement_single_frame(output_frame, camera_movement)
 
-                        # Convert BGR to RGB for display
-                        output_frame = cv2.cvtColor(output_frame, cv2.COLOR_BGR2RGB)
+                        # Push to broadcast server
+                        if pusher is not None:
+                            pusher.push(output_frame)
 
-                        # Apply realtime zoom (center crop + resize)
+                        # Apply zoom before display
                         if rt_zoom > 1.0:
                             h, w = output_frame.shape[:2]
                             crop_w = int(w / rt_zoom)
@@ -1238,32 +1485,25 @@ else:  # Realtime Analysis
                             output_frame = output_frame[y1:y1+crop_h, x1:x1+crop_w]
                             output_frame = cv2.resize(output_frame, (w, h))
 
-                        # Push annotated frame to broadcast server (MJPEG + RTMP)
-                        if pusher is not None:
-                            pusher.push(output_frame)
-
-                        # Limit display width to prevent oversized video
-                        max_display_w = 1280
-                        h, w = output_frame.shape[:2]
-                        if w > max_display_w:
-                            new_h = int(h * max_display_w / w)
-                            output_frame = cv2.resize(output_frame, (max_display_w, new_h))
-
-                        st_frame.image(output_frame, channels="RGB")
+                        # Display frame in Streamlit
+                        # Convert BGR (OpenCV) → RGB for Streamlit display
+                        display_frame = cv2.cvtColor(output_frame, cv2.COLOR_BGR2RGB)
+                        st_frame.image(display_frame, channels="RGB")
 
                         # Update status every 30 frames
                         if frame_count % 30 == 0:
-                            st_status.success(f"✅ Processing... Frame {frame_count}")
-                    
+                            elapsed = time.time() - _fps_start
+                            fps = frame_count / elapsed if elapsed > 0 else 0
+                            st_debug_area.info(f"Frame {frame_count} | ~{fps:.1f} FPS")
+
                     cap.release()
-                    st_status.info("⏹️ Analysis stopped")
-        
+                    st_debug_area.info("⏹️ Stopped")
+
         except Exception as e:
-            st.error(f"❌ Error: {str(e)}")
+            st.error(f"Error: {str(e)}")
             import traceback
-            with st.expander("Error Details"):
-                st.code(traceback.format_exc())
-    
+            st.code(traceback.format_exc())
+
     elif st.session_state.analysis_running and source_path is None:
         st.error("❌ Please select a valid video source")
     else:
@@ -1273,7 +1513,8 @@ else:  # Realtime Analysis
         st.markdown("""
         ### 🎯 Features
         - **Realtime Analysis**: Process live video streams with minimal latency
-        - **Multiple Sources**: Webcam, video file, or URL stream
+        - **Multiple Sources**: Webcam, video file, URL stream, or **Booca Stream**
+        - **Booca Integration**: Analyze live streams & recorded VODs from Booca.online
         - **Player Tracking**: Individual player identification and tracking
         - **Team Assignment**: Automatic team color detection
         - **Ball Possession**: Real-time possession statistics
@@ -1284,6 +1525,11 @@ else:  # Realtime Analysis
         2. Choose **Video Source** type
         3. Configure visualization options
         4. Click **Start Analysis**
+        
+        ### 🟢 Booca Stream
+        Paste a Booca URL to instantly analyze football streams:
+        - 🔴 **Live:** `https://booca.online/livestream/watch/{id}`
+        - 📹 **VOD:** `https://booca.online/livestream/vod/{id}`
         
         ### 📱 Using Phone as Camera
         Install **DroidCam** or **IP Webcam** app on your phone, connect to same WiFi, 
