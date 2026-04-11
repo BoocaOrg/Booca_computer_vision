@@ -48,6 +48,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─────────────────────────────────────────────
+# Mount Highlight Worker (so both services run on one port)
+# ─────────────────────────────────────────────
+from cv_service.highlight_worker import app as highlight_app
+app.mount("/highlight-worker", highlight_app)
+
 
 # ─────────────────────────────────────────────
 # Pydantic models
