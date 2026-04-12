@@ -4,10 +4,15 @@ services:
     runtime: python
     buildCommand: |
       pip install -r requirements.txt
+      python -c "import matplotlib.pyplot; import ultralytics"
     startCommand: |
-      cd /opt/render/project/src && uvicorn cv_service.cv_api:app --host 0.0.0.0 --port $PORT
+      uvicorn cv_service.cv_api:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHONPATH
         value: /opt/render/project/src
       - key: PYTHON_VERSION
         value: "3.11.11"
+      - key: YOLO_CONFIG_DIR
+        value: /tmp/Ultralytics
+      - key: MPLCONFIGDIR
+        value: /tmp/matplotlib
