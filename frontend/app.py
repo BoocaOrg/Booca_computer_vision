@@ -11,6 +11,13 @@ import base64
 # Add parent directory to path
 sys.path.append(os.path.abspath("."))
 
+# Load .env file so BOOCA_API_URL etc. are available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import threading
 import queue
 
@@ -19,6 +26,56 @@ from trackers import Tracker
 from team_assignment import TeamAssigner
 from player_ball_assignment import PlayerBallAssigner
 from camera_movement import CameraMovementEstimator
+from cv_service.speed_estimator import SpeedEstimator
+from cv_service.tactical_analyzer import TacticalAnalyzer
+from cv_service.event_detector import EventDetector
+from cv_service.minimap import render_minimap_rgb
+from cv_service.match_sim import render_match_sim_rgb
+
+# --- Proxy Server for BunnyCDN/HLS streams ---
+import requests
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import socket
+
+class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        target_url = self.path[1:]
+        headers = {
+            "Referer": "https://booca.online/",
+            "User-Agent": "Mozilla/5.0",
+        }
+        try:
+            resp = requests.get(target_url, headers=headers, timeout=10)
+            self.send_response(resp.status_code)
+            self.send_header("Content-Length", str(len(resp.content)))
+            self.send_header("Content-Type", resp.headers.get("Content-Type", "video/MP2T"))
+            self.end_headers()
+            self.wfile.write(resp.content)
+        except Exception:
+            self.send_error(500)
+
+class SimpleProxy:
+    def __init__(self):
+        # find open port
+        sock = socket.socket()
+        sock.bind(('', 0))
+        self.port = sock.getsockname()[1]
+        sock.close()
+        
+        self.server = HTTPServer(('127.0.0.1', self.port), ProxyHTTPRequestHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        time.sleep(0.5)
+        
+    def get_proxy_url(self, target_url):
+        if "127.0.0.1" in target_url or "localhost" in target_url:
+            return target_url # don't proxy locals
+        return f"http://127.0.0.1:{self.port}/{target_url}"
+
+@st.cache_resource
+def get_hls_proxy():
+    return SimpleProxy()
+# ---------------------------------------------
 
 # Broadcast frame pusher (non-blocking HTTP POST to broadcast_server.py)
 try:
@@ -428,11 +485,16 @@ st.markdown("### Automated Match Analysis using Computer Vision & Deep Learning"
 # Sidebar Configuration
 st.sidebar.header("⚙️ Configuration")
 
+# Query params for auto-configuration
+query_params = st.query_params
+injected_stream_id = query_params.get("streamId")
+
 # Mode Selection
 st.sidebar.subheader("📊 Analysis Mode")
 analysis_mode = st.sidebar.radio(
     "Select Mode",
     ["Offline Processing", "Realtime Analysis"],
+    index=1 if injected_stream_id else 0,
     help="Offline: Process entire video and save output. Realtime: Analyze live video stream."
 )
 
@@ -448,12 +510,12 @@ show_stats = st.sidebar.checkbox("Show Possession Stats", True)
 st.sidebar.subheader("⚡ Performance")
 frame_skip = st.sidebar.slider(
     "Frame Skip (process every Nth frame)",
-    min_value=1, max_value=5, value=2,
+    min_value=1, max_value=5, value=3 if injected_stream_id else 2,
     help="Higher = faster but less smooth. 1 = process every frame, 3 = process every 3rd frame"
 )
 resolution_scale = st.sidebar.slider(
     "Resolution Scale",
-    min_value=0.25, max_value=1.0, value=0.5, step=0.25,
+    min_value=0.25, max_value=1.0, value=0.25 if injected_stream_id else 0.5, step=0.25,
     help="Lower = faster. 0.5 = half resolution"
 )
 
@@ -474,7 +536,7 @@ use_fp16 = st.sidebar.checkbox(
 )
 imgsz = st.sidebar.slider(
     "YOLO Input Size",
-    min_value=320, max_value=1280, value=640, step=64,
+    min_value=320, max_value=1280, value=448 if injected_stream_id else 640, step=64,
     help="Lower = faster inference. 416 recommended for RTX 3050."
 )
 model_choice = st.sidebar.selectbox(
@@ -497,6 +559,11 @@ elif model_choice == "models/best.onnx (ONNX)":
 else:
     model_path = "models/best.pt"
 st.sidebar.caption(f"Active model: {model_path}")
+use_cache = st.sidebar.checkbox(
+    "Use Cached Tracks",
+    value=True,
+    help="Save and load tracks locally to avoid re-running DL models on same video."
+)
 
 # Broadcast Controls
 st.sidebar.subheader("📡 Broadcast")
@@ -571,7 +638,7 @@ if analysis_mode == "Offline Processing":
             _stream_id = None
             
             # Extract stream ID
-            _match = _re.search(r'booca\.(?:online|vn)/livestream/(?:watch|vod)/([a-f0-9]{24})', _vod_url)
+            _match = _re.search(r'booca\.(?:online|vn)/(?:livestream|streaming)/(?:watch|vod|live)/([a-f0-9]{24})', _vod_url)
             if _match:
                 _stream_id = _match.group(1)
             elif _re.match(r'^[a-f0-9]{24}$', _vod_url):
@@ -579,8 +646,9 @@ if analysis_mode == "Offline Processing":
             
             if _stream_id:
                 try:
+                    api_base = os.getenv("BOOCA_API_URL", "http://localhost:5000/api")
                     _api_resp = _req.get(
-                        f"https://api.booca.online/api/streams/{_stream_id}",
+                        f"{api_base}/streams/{_stream_id}",
                         headers={
                             'User-Agent': 'Mozilla/5.0',
                             'Accept': 'application/json',
@@ -624,7 +692,7 @@ if analysis_mode == "Offline Processing":
                         
                         if _thumbnail:
                             try:
-                                st.sidebar.image(_thumbnail, use_container_width=True)
+                                st.sidebar.image(_thumbnail, width="stretch")
                             except Exception:
                                 pass
                         
@@ -705,7 +773,7 @@ if analysis_mode == "Offline Processing":
     _can_process = video_data is not None or bool(_booca_vod_url)
     
     if _can_process:
-        if st.sidebar.button("🚀 Start Analysis", type="primary", use_container_width=True):
+        if st.sidebar.button("🚀 Start Analysis", type="primary", use_container_width="always"):
             with st.spinner("🔄 Processing video... This may take several minutes."):
                 try:
                     if video_data:
@@ -724,6 +792,12 @@ if analysis_mode == "Offline Processing":
                                 "Origin: https://booca.online"
                             )
                             _cap = cv2.VideoCapture(_booca_vod_url, cv2.CAP_FFMPEG)
+                        
+                        # Fix BunnyCDN Referer drop bug using our background HTTP proxy for VOD
+                        if not _cap.isOpened():
+                            proxy = get_hls_proxy()
+                            proxied_url = proxy.get_proxy_url(_booca_vod_url)
+                            _cap = cv2.VideoCapture(proxied_url, cv2.CAP_FFMPEG)
                         
                         if not _cap.isOpened():
                             raise RuntimeError(f"Cannot open VOD stream: {_booca_vod_url[:60]}")
@@ -758,18 +832,43 @@ if analysis_mode == "Offline Processing":
                         raise RuntimeError("No video source available")
                     
                     progress_bar = st.progress(0, text="Initializing models...")
+                    import pickle
+                    import re
                     
-                    # Track objects
+                    safe_video_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', video_name) if video_name else "unknown_video"
+                    os.makedirs("stubs", exist_ok=True)
+                    tracks_stub_path = f"stubs/tracks_{safe_video_name}.pkl"
+                    camera_stub_path = f"stubs/camera_movement_{safe_video_name}.pkl"
+                    
+                    tracks = None
+                    camera_movement_per_frame = None
+                    
+                    # Initialize Models
                     tracker = Tracker(model_path, class_ids, verbose=False, fp16=use_fp16, imgsz=imgsz)
-                    progress_bar.progress(10, text="Tracking objects...")
-                    
-                    tracks = tracker.get_object_tracks(frames)
-                    tracker.add_position_to_tracks(tracks)
-                    progress_bar.progress(30, text="Estimating camera movement...")
-                    
-                    # Camera movement
                     camera_movement_estimator = CameraMovementEstimator(frames[0], class_ids, verbose=False)
-                    camera_movement_per_frame = camera_movement_estimator.get_camera_movement(frames)
+
+                    if use_cache and os.path.exists(tracks_stub_path) and os.path.exists(camera_stub_path):
+                        progress_bar.progress(20, text="Loading cached tracks...")
+                        with open(tracks_stub_path, "rb") as f:
+                            tracks = pickle.load(f)
+                        with open(camera_stub_path, "rb") as f:
+                            camera_movement_per_frame = pickle.load(f)
+                    
+                    if tracks is None or camera_movement_per_frame is None:
+                        progress_bar.progress(10, text="Tracking objects...")
+                        
+                        tracks = tracker.get_object_tracks(frames)
+                        tracker.add_position_to_tracks(tracks)
+                        
+                        progress_bar.progress(30, text="Estimating camera movement...")
+                        camera_movement_per_frame = camera_movement_estimator.get_camera_movement(frames)
+                        
+                        if use_cache:
+                            with open(tracks_stub_path, "wb") as f:
+                                pickle.dump(tracks, f)
+                            with open(camera_stub_path, "wb") as f:
+                                pickle.dump(camera_movement_per_frame, f)
+                    
                     camera_movement_estimator.adjust_positions_to_tracks(tracks, camera_movement_per_frame)
                     progress_bar.progress(50, text="Interpolating ball positions...")
                     
@@ -785,7 +884,78 @@ if analysis_mode == "Offline Processing":
                     # Ball possession
                     player_assigner = PlayerBallAssigner()
                     player_assigner.get_player_and_possession(tracks)
-                    progress_bar.progress(85, text="Drawing annotations...")
+                    progress_bar.progress(80, text="Running advanced analytics...")
+                    
+                    # ============================================================
+                    # ADVANCED ANALYTICS — SpeedEstimator, TacticalAnalyzer, EventDetector
+                    # ============================================================
+                    frame_h, frame_w = frames[0].shape[:2]
+                    speed_estimator = SpeedEstimator(fps=fps)
+                    tactical_analyzer = TacticalAnalyzer()
+                    event_detector = EventDetector(frame_width=frame_w, frame_height=frame_h)
+                    
+                    all_events = []
+                    all_top_speeds = []
+                    
+                    for f_idx in range(len(frames)):
+                        # Build single-frame tracks dict for the analyzers
+                        sf_tracks = {
+                            "players": tracks["players"][f_idx] if f_idx < len(tracks["players"]) else {},
+                            "referees": tracks["referees"][f_idx] if f_idx < len(tracks["referees"]) else {},
+                            "ball": tracks["ball"][f_idx] if f_idx < len(tracks["ball"]) else {},
+                        }
+                        
+                        # Speed & distance estimation
+                        top_players = speed_estimator.update_speeds(sf_tracks, f_idx)
+                        if top_players:
+                            all_top_speeds = top_players  # keep latest
+                        
+                        # Heatmap tracking
+                        tactical_analyzer.update_heatmap(sf_tracks)
+                        
+                        # Pass detection
+                        bp = player_assigner.ball_possession
+                        current_possessor = None
+                        if bp is not None and f_idx < len(bp) and bp[f_idx] in [1, 2]:
+                            # Find which player has the ball
+                            for pid, pdata in sf_tracks["players"].items():
+                                if pdata.get("has_ball", False):
+                                    current_possessor = pid
+                                    break
+                        
+                        pass_event = tactical_analyzer.detect_passes(sf_tracks, current_possessor, f_idx)
+                        if pass_event:
+                            all_events.append(pass_event)
+                        
+                        # Event detection (goals)
+                        goal_event = event_detector.check_events(sf_tracks, f_idx)
+                        if goal_event:
+                            goal_event["frame"] = f_idx
+                            all_events.append(goal_event)
+                    
+                    # Tactical analysis (formations + space control)
+                    last_frame_tracks = {
+                        "players": tracks["players"][-1] if tracks["players"] else {},
+                        "referees": tracks["referees"][-1] if tracks["referees"] else {},
+                        "ball": tracks["ball"][-1] if tracks["ball"] else {},
+                    }
+                    tactical_result = tactical_analyzer.analyze_tactics(last_frame_tracks)
+                    
+                    # Collect all player stats
+                    all_player_stats = {}
+                    for pid in speed_estimator.total_distances:
+                        all_player_stats[pid] = {
+                            "total_distance_m": round(speed_estimator.total_distances[pid], 1),
+                            "sprint_count": speed_estimator.sprint_counts.get(pid, 0),
+                            "current_speed": speed_estimator.current_speeds.get(pid, 0),
+                        }
+                        # Add team info
+                        for frame_tracks in reversed(tracks["players"]):
+                            if pid in frame_tracks and "team" in frame_tracks[pid]:
+                                all_player_stats[pid]["team"] = frame_tracks[pid]["team"]
+                                break
+                    
+                    progress_bar.progress(88, text="Drawing annotations...")
                     
                     # Draw annotations
                     output = tracker.draw_annotations(frames, tracks, player_assigner.ball_possession)
@@ -806,7 +976,327 @@ if analysis_mode == "Offline Processing":
                     st.subheader("📹 Processed Video")
                     theme_mode = get_theme_mode()
                     player_html = get_custom_video_player_html(output_path, theme=theme_mode)
-                    components.html(player_html, height=620, scrolling=False)
+                    # The embedded iframe height must be large enough, otherwise the video can appear "cut off"
+                    # (common on 16:9 sources with custom controls).
+                    offline_player_height = int(os.getenv("OFFLINE_PLAYER_HEIGHT", "780"))
+                    v_col, mm_col = st.columns([3, 1], vertical_alignment="top")
+                    with v_col:
+                        components.html(player_html, height=offline_player_height, scrolling=True)
+
+                    with mm_col:
+                        st.markdown("#### 🗺️ Minimap")
+                        try:
+                            total_frames_count = len(frames)
+                            default_idx = max(0, total_frames_count - 1)
+                            sel_idx = st.slider(
+                                "Frame",
+                                min_value=0,
+                                max_value=max(0, total_frames_count - 1),
+                                value=default_idx,
+                                step=1,
+                                help="Kéo để xem minimap/mô phỏng theo thời gian (bóng sẽ di chuyển theo frame).",
+                            )
+
+                            sel_players = tracks["players"][sel_idx] if isinstance(tracks, dict) and tracks.get("players") else {}
+                            sel_ball = tracks["ball"][sel_idx] if isinstance(tracks, dict) and tracks.get("ball") else {}
+
+                            # Normalize ball track shape to what minimap expects: {1: {"bbox": ...}}
+                            if isinstance(sel_ball, list):
+                                # If it's a list of ball detections, pick first one as id=1
+                                sel_ball = {1: sel_ball[0]} if len(sel_ball) > 0 and isinstance(sel_ball[0], dict) else {}
+                            elif isinstance(sel_ball, dict) and "bbox" in sel_ball and 1 not in sel_ball:
+                                # If it's a single ball dict, wrap it
+                                sel_ball = {1: sel_ball}
+
+                            sel_tracks = {"players": sel_players or {}, "ball": sel_ball or {}}
+
+                            # Build short history for a nicer "simulation" trail
+                            trail_len = int(os.getenv("OFFLINE_SIM_TRAIL_LEN", "20"))
+                            start_i = max(0, sel_idx - trail_len)
+                            hist = []
+                            if isinstance(tracks, dict) and tracks.get("ball"):
+                                for i in range(start_i, sel_idx + 1):
+                                    b = tracks["ball"][i]
+                                    if isinstance(b, list):
+                                        b = {1: b[0]} if len(b) > 0 and isinstance(b[0], dict) else {}
+                                    elif isinstance(b, dict) and "bbox" in b and 1 not in b:
+                                        b = {1: b}
+                                    hist.append({"ball": b or {}})
+
+                            mm = render_minimap_rgb(sel_tracks, width=360, height=200)
+                            st.image(mm, channels="RGB", use_container_width=True)
+                            st.caption("Bóng (vàng) & cầu thủ cầm bóng (viền theo đội)")
+
+                            st.markdown("#### 🎮 Mô phỏng")
+                            sim = render_match_sim_rgb(sel_tracks, ball_history=hist, width=360, height=220)
+                            st.image(sim, channels="RGB", use_container_width=True)
+                        except Exception as e:
+                            st.info("Minimap (offline) chưa render được cho video này.")
+                            with st.expander("Xem lỗi minimap"):
+                                st.code(str(e))
+                    
+                    # ============================================================
+                    # 📊 ANALYTICS DASHBOARD
+                    # ============================================================
+                    st.markdown("---")
+                    st.subheader("📊 Match Analytics Dashboard")
+                    
+                    is_dark = theme_mode == "dark"
+                    _card_bg = "#1e293b" if is_dark else "#f8fafc"
+                    _card_border = "#334155" if is_dark else "#e2e8f0"
+                    _text_primary = "#f1f5f9" if is_dark else "#1e293b"
+                    _text_secondary = "#94a3b8" if is_dark else "#64748b"
+                    _accent_1 = "#3b82f6"
+                    _accent_2 = "#ef4444"
+                    _accent_green = "#22c55e"
+                    
+                    # --- Row 1: Key Metrics ---
+                    total_frames_count = len(frames)
+                    match_duration_sec = total_frames_count / fps if fps > 0 else 0
+                    match_duration_min = match_duration_sec / 60
+                    
+                    bp_arr = player_assigner.ball_possession
+                    t1_poss = int(np.sum(bp_arr == 1)) if bp_arr is not None and len(bp_arr) > 0 else 0
+                    t2_poss = int(np.sum(bp_arr == 2)) if bp_arr is not None and len(bp_arr) > 0 else 0
+                    total_poss = t1_poss + t2_poss
+                    t1_poss_pct = round(t1_poss / total_poss * 100) if total_poss > 0 else 50
+                    t2_poss_pct = 100 - t1_poss_pct
+                    
+                    t1_passes = sum(1 for e in all_events if e.get("event") == "pass" and e.get("scoring_team", e.get("scoringTeam")) == 1)
+                    t2_passes = sum(1 for e in all_events if e.get("event") == "pass" and e.get("scoring_team", e.get("scoringTeam")) == 2)
+                    t1_goals = sum(1 for e in all_events if e.get("event") == "goal" and e.get("scoring_team") == 1)
+                    t2_goals = sum(1 for e in all_events if e.get("event") == "goal" and e.get("scoring_team") == 2)
+                    
+                    num_players_tracked = len(all_player_stats)
+                    
+                    def _metric_card(label, value, icon, accent_color):
+                        return f"""
+                        <div style="background:{_card_bg}; border:1px solid {_card_border}; border-radius:12px; 
+                                    padding:20px 16px; text-align:center; position:relative; overflow:hidden;">
+                            <div style="position:absolute; top:0; left:0; right:0; height:3px; background:{accent_color};"></div>
+                            <div style="font-size:28px; margin-bottom:6px;">{icon}</div>
+                            <div style="font-size:28px; font-weight:700; color:{_text_primary}; margin-bottom:4px;">{value}</div>
+                            <div style="font-size:12px; color:{_text_secondary}; text-transform:uppercase; letter-spacing:1px;">{label}</div>
+                        </div>
+                        """
+                    
+                    m_col1, m_col2, m_col3, m_col4, m_col5 = st.columns(5)
+                    with m_col1:
+                        st.markdown(_metric_card("Duration", f"{match_duration_min:.1f} min", "⏱️", _accent_1), unsafe_allow_html=True)
+                    with m_col2:
+                        st.markdown(_metric_card("Frames", f"{total_frames_count:,}", "🎬", _accent_green), unsafe_allow_html=True)
+                    with m_col3:
+                        st.markdown(_metric_card("Players Tracked", str(num_players_tracked), "👥", "#a855f7"), unsafe_allow_html=True)
+                    with m_col4:
+                        st.markdown(_metric_card("Total Passes", str(t1_passes + t2_passes), "🔄", "#f59e0b"), unsafe_allow_html=True)
+                    with m_col5:
+                        st.markdown(_metric_card("Goals Detected", str(t1_goals + t2_goals), "⚽", _accent_2), unsafe_allow_html=True)
+                    
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    
+                    # --- Row 2: Possession & Space Control ---
+                    poss_col, space_col = st.columns(2)
+                    
+                    with poss_col:
+                        st.markdown(f"""
+                        <div style="background:{_card_bg}; border:1px solid {_card_border}; border-radius:12px; padding:24px;">
+                            <h4 style="color:{_text_primary}; margin:0 0 16px 0; font-size:16px;">⚽ Ball Possession</h4>
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                                <div style="text-align:center;">
+                                    <div style="font-size:32px; font-weight:700; color:{_accent_1};">{t1_poss_pct}%</div>
+                                    <div style="color:{_text_secondary}; font-size:13px;">Team 1</div>
+                                </div>
+                                <div style="font-size:20px; color:{_text_secondary};">vs</div>
+                                <div style="text-align:center;">
+                                    <div style="font-size:32px; font-weight:700; color:{_accent_2};">{t2_poss_pct}%</div>
+                                    <div style="color:{_text_secondary}; font-size:13px;">Team 2</div>
+                                </div>
+                            </div>
+                            <div style="background:{_card_border}; border-radius:6px; height:12px; overflow:hidden;">
+                                <div style="background:linear-gradient(90deg, {_accent_1}, #60a5fa); height:100%; width:{t1_poss_pct}%; border-radius:6px;"></div>
+                            </div>
+                            <div style="display:flex; justify-content:space-between; margin-top:12px;">
+                                <div style="color:{_text_secondary}; font-size:12px;">Passes: {t1_passes}</div>
+                                <div style="color:{_text_secondary}; font-size:12px;">Passes: {t2_passes}</div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    with space_col:
+                        sc = tactical_result.get("space_control", {"team1": 50.0, "team2": 50.0})
+                        formations = tactical_result.get("formations", {})
+                        f1 = formations.get(1, "N/A")
+                        f2 = formations.get(2, "N/A")
+                        
+                        st.markdown(f"""
+                        <div style="background:{_card_bg}; border:1px solid {_card_border}; border-radius:12px; padding:24px;">
+                            <h4 style="color:{_text_primary}; margin:0 0 16px 0; font-size:16px;">🗺️ Space Control & Formations</h4>
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                                <div style="text-align:center;">
+                                    <div style="font-size:32px; font-weight:700; color:{_accent_1};">{sc['team1']}%</div>
+                                    <div style="color:{_text_secondary}; font-size:13px;">Team 1</div>
+                                </div>
+                                <div style="font-size:20px; color:{_text_secondary};">vs</div>
+                                <div style="text-align:center;">
+                                    <div style="font-size:32px; font-weight:700; color:{_accent_2};">{sc['team2']}%</div>
+                                    <div style="color:{_text_secondary}; font-size:13px;">Team 2</div>
+                                </div>
+                            </div>
+                            <div style="background:{_card_border}; border-radius:6px; height:12px; overflow:hidden;">
+                                <div style="background:linear-gradient(90deg, {_accent_1}, #60a5fa); height:100%; width:{sc['team1']}%; border-radius:6px;"></div>
+                            </div>
+                            <div style="display:flex; justify-content:space-between; margin-top:12px;">
+                                <div style="color:{_text_secondary}; font-size:12px;">Formation: <b style="color:{_text_primary}">{f1}</b></div>
+                                <div style="color:{_text_secondary}; font-size:12px;">Formation: <b style="color:{_text_primary}">{f2}</b></div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    
+                    # --- Row 3: Player Performance Table ---
+                    st.markdown(f"""
+                    <div style="background:{_card_bg}; border:1px solid {_card_border}; border-radius:12px; padding:24px;">
+                        <h4 style="color:{_text_primary}; margin:0 0 16px 0; font-size:16px;">🏃 Player Performance Rankings</h4>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    if all_player_stats:
+                        # Sort by total distance
+                        sorted_players = sorted(
+                            all_player_stats.items(),
+                            key=lambda x: x[1].get("total_distance_m", 0),
+                            reverse=True
+                        )[:15]  # Top 15
+                        
+                        perf_data = []
+                        for rank, (pid, stats) in enumerate(sorted_players, 1):
+                            team = stats.get("team", "?")
+                            team_label = f"🔵 Team 1" if team == 1 else f"🔴 Team 2" if team == 2 else "⚪ N/A"
+                            perf_data.append({
+                                "Rank": rank,
+                                "Player ID": int(pid),
+                                "Team": team_label,
+                                "Distance (m)": f"{stats['total_distance_m']:.1f}",
+                                "Top Speed (km/h)": f"{stats['current_speed']:.1f}",
+                                "Sprints": stats["sprint_count"],
+                            })
+                        
+                        import pandas as _pd
+                        perf_df = _pd.DataFrame(perf_data)
+                        st.dataframe(perf_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No player performance data available.")
+                    
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    
+                    # --- Row 4: Team Heatmaps ---
+                    st.markdown(f"""
+                    <div style="background:{_card_bg}; border:1px solid {_card_border}; border-radius:12px; padding:24px;">
+                        <h4 style="color:{_text_primary}; margin:0 0 16px 0; font-size:16px;">🔥 Team Heatmaps</h4>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    heatmaps = tactical_result.get("heatmaps", {})
+                    hm_col1, hm_col2 = st.columns(2)
+                    
+                    with hm_col1:
+                        st.markdown(f"<p style='color:{_accent_1}; font-weight:600; text-align:center;'>🔵 Team 1 Activity</p>", unsafe_allow_html=True)
+                        t1_hm = np.array(heatmaps.get("team1", np.zeros((10, 10))))
+                        if np.max(t1_hm) > 0:
+                            import matplotlib
+                            matplotlib.use('Agg')
+                            import matplotlib.pyplot as plt
+                            fig1, ax1 = plt.subplots(figsize=(5, 3))
+                            fig1.patch.set_facecolor('#0e1117' if is_dark else '#ffffff')
+                            ax1.set_facecolor('#0e1117' if is_dark else '#ffffff')
+                            # 10x10 grid → use nearest to avoid "blurry" artifacts
+                            im1 = ax1.imshow(
+                                t1_hm,
+                                cmap='Blues',
+                                interpolation='nearest',
+                                aspect='equal',
+                                origin='lower',
+                                vmin=0.0,
+                                vmax=1.0,
+                            )
+                            ax1.set_title("Team 1 Heatmap", color=_text_primary, fontsize=11)
+                            ax1.set_xticks([])
+                            ax1.set_yticks([])
+                            for spine in ax1.spines.values():
+                                spine.set_visible(False)
+                            plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+                            st.pyplot(fig1)
+                            plt.close(fig1)
+                        else:
+                            st.info("No heatmap data for Team 1")
+                    
+                    with hm_col2:
+                        st.markdown(f"<p style='color:{_accent_2}; font-weight:600; text-align:center;'>🔴 Team 2 Activity</p>", unsafe_allow_html=True)
+                        t2_hm = np.array(heatmaps.get("team2", np.zeros((10, 10))))
+                        if np.max(t2_hm) > 0:
+                            import matplotlib
+                            matplotlib.use('Agg')
+                            import matplotlib.pyplot as plt
+                            fig2, ax2 = plt.subplots(figsize=(5, 3))
+                            fig2.patch.set_facecolor('#0e1117' if is_dark else '#ffffff')
+                            ax2.set_facecolor('#0e1117' if is_dark else '#ffffff')
+                            im2 = ax2.imshow(
+                                t2_hm,
+                                cmap='Reds',
+                                interpolation='nearest',
+                                aspect='equal',
+                                origin='lower',
+                                vmin=0.0,
+                                vmax=1.0,
+                            )
+                            ax2.set_title("Team 2 Heatmap", color=_text_primary, fontsize=11)
+                            ax2.set_xticks([])
+                            ax2.set_yticks([])
+                            for spine in ax2.spines.values():
+                                spine.set_visible(False)
+                            plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+                            st.pyplot(fig2)
+                            plt.close(fig2)
+                        else:
+                            st.info("No heatmap data for Team 2")
+                    
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    
+                    # --- Row 5: Event Timeline ---
+                    if all_events:
+                        st.markdown(f"""
+                        <div style="background:{_card_bg}; border:1px solid {_card_border}; border-radius:12px; padding:24px;">
+                            <h4 style="color:{_text_primary}; margin:0 0 16px 0; font-size:16px;">📋 Event Timeline</h4>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        for evt in all_events[:30]:  # Show up to 30 events
+                            evt_frame = evt.get("frame", 0)
+                            evt_time_sec = evt_frame / fps if fps > 0 else 0
+                            evt_min = int(evt_time_sec // 60)
+                            evt_sec = int(evt_time_sec % 60)
+                            
+                            if evt.get("event") == "goal":
+                                scoring = evt.get("scoring_team", "?")
+                                team_color = _accent_1 if scoring == 1 else _accent_2
+                                st.markdown(f"""
+                                <div style="background:{_card_bg}; border-left:4px solid {team_color}; padding:10px 16px; margin:4px 0; border-radius:0 8px 8px 0;">
+                                    <span style="color:{team_color}; font-weight:700;">⚽ GOAL</span>
+                                    <span style="color:{_text_secondary}; margin-left:12px;">{evt_min}:{evt_sec:02d}</span>
+                                    <span style="color:{_text_primary}; margin-left:12px;">Team {scoring} scored ({evt.get('side', '')} side)</span>
+                                </div>
+                                """, unsafe_allow_html=True)
+                            elif evt.get("event") == "pass":
+                                scoring_team = evt.get("scoring_team", evt.get("scoringTeam", "?"))
+                                team_color = _accent_1 if scoring_team == 1 else _accent_2
+                                st.markdown(f"""
+                                <div style="background:{_card_bg}; border-left:4px solid {_accent_green}; padding:8px 16px; margin:2px 0; border-radius:0 8px 8px 0;">
+                                    <span style="color:{_accent_green}; font-weight:600;">🔄 Pass</span>
+                                    <span style="color:{_text_secondary}; margin-left:12px;">{evt_min}:{evt_sec:02d}</span>
+                                    <span style="color:{_text_primary}; margin-left:12px;">Player {evt.get('from_player', '?')} → Player {evt.get('to_player', '?')} (Team {scoring_team})</span>
+                                </div>
+                                """, unsafe_allow_html=True)
                     
                 except Exception as e:
                     st.error(f"❌ Error during processing: {str(e)}")
@@ -855,8 +1345,8 @@ else:  # Realtime Analysis
         stream_id = None
         is_vod = False
         
-        # Pattern: /livestream/watch/{id} or /livestream/vod/{id}
-        match = re.search(r'booca\.(?:online|vn)/livestream/(?:watch|vod)/([a-f0-9]{24})', url)
+        # Pattern: /livestream/watch/{id} or /livestream/vod/{id} or /streaming/live/{id} or /streaming/vod/{id}
+        match = re.search(r'booca\.(?:online|vn)/(?:livestream|streaming)/(?:watch|vod|live)/([a-f0-9]{24})', url)
         if match:
             stream_id = match.group(1)
             is_vod = '/vod/' in url
@@ -868,7 +1358,8 @@ else:  # Realtime Analysis
             return None, "Invalid Booca URL. Use format: https://booca.online/livestream/watch/{id} or /vod/{id}"
         
         # Call Booca API
-        api_url = f"https://api.booca.online/api/streams/{stream_id}"
+        api_base = os.getenv("BOOCA_API_URL", "http://localhost:5000/api")
+        api_url = f"{api_base}/streams/{stream_id}"
         try:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -958,7 +1449,7 @@ else:  # Realtime Analysis
             return url
         
         # Method 0a: Booca.online livestream/VOD
-        if 'booca.online/livestream/' in url or 'booca.vn/livestream/' in url:
+        if 'booca.online/livestream/' in url or 'booca.vn/livestream/' in url or 'streaming/live/' in url:
             st.sidebar.text("🔍 Resolving Booca stream...")
             stream_url, info = resolve_booca_url(url)
             if stream_url:
@@ -1194,7 +1685,7 @@ else:  # Realtime Analysis
         
         booca_url_input = st.sidebar.text_input(
             "Booca URL or Stream ID",
-            value="",
+            value=injected_stream_id if injected_stream_id else "",
             placeholder="https://booca.online/livestream/watch/...",
             help="Paste the full Booca URL or just the 24-character stream ID"
         )
@@ -1237,7 +1728,7 @@ else:  # Realtime Analysis
                 
                 if thumbnail:
                     try:
-                        st.sidebar.image(thumbnail, use_container_width=True)
+                        st.sidebar.image(thumbnail, width="stretch")
                     except Exception:
                         pass
                 
@@ -1296,6 +1787,11 @@ else:  # Realtime Analysis
     # Session state for realtime processing
     if "analysis_running" not in st.session_state:
         st.session_state.analysis_running = False
+        
+    # Auto start if provided via query params and resolved successfully
+    if injected_stream_id and source_path is not None and "auto_started" not in st.session_state:
+        st.session_state.analysis_running = True
+        st.session_state.auto_started = True
     
     def start_analysis():
         st.session_state.analysis_running = True
@@ -1307,9 +1803,9 @@ else:  # Realtime Analysis
     col1, col2 = st.sidebar.columns(2)
     with col1:
         if not st.session_state.analysis_running:
-            st.button("▶️ Start", on_click=start_analysis, type="primary", use_container_width=True, disabled=source_path is None)
+            st.button("▶️ Start", on_click=start_analysis, type="primary", use_container_width="always", disabled=source_path is None)
         else:
-            st.button("⏸️ Stop", on_click=stop_analysis, type="secondary", use_container_width=True)
+            st.button("⏸️ Stop", on_click=stop_analysis, type="secondary", use_container_width="always")
     
     # Main content area
     if st.session_state.analysis_running and source_path is not None:
@@ -1331,6 +1827,7 @@ else:  # Realtime Analysis
 
         # Video display — st.image() shows frames directly
         st_frame = st.empty()
+        st_minimap = st.empty()
 
         # Sidebar controls
         rt_zoom = st.sidebar.slider("Zoom", 1.0, 3.0, 1.0, 0.25, key="rt_zoom_level")
@@ -1370,14 +1867,22 @@ else:  # Realtime Analysis
                         "Origin: https://booca.online"
                     )
                     cap = cv2.VideoCapture(source_path, cv2.CAP_FFMPEG)
+
+                # Fix BunnyCDN Referer drop bug using our background HTTP proxy
+                if not cap.isOpened():
+                    proxy = get_hls_proxy()
+                    proxied_url = proxy.get_proxy_url(source_path)
+                    cap = cv2.VideoCapture(proxied_url, cv2.CAP_FFMPEG)
             else:
                 if use_nvdec:
                     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "hwaccel;cuda|video_codec;h264_cuvid"
 
                 cap = cv2.VideoCapture(source_path, cv2.CAP_FFMPEG)
                 if not cap.isOpened() and isinstance(source_path, str) and ".m3u8" in source_path:
-                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"protocol_whitelist;file,http,https,tcp,tls,crypto|headers;User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\nReferer: {stream_referer}\r\nOrigin: {stream_referer}"
-                    cap = cv2.VideoCapture(source_path, cv2.CAP_FFMPEG)
+                    # Fix BunnyCDN Referer drop bug using our background HTTP proxy
+                    proxy = get_hls_proxy()
+                    proxied_url = proxy.get_proxy_url(source_path)
+                    cap = cv2.VideoCapture(proxied_url, cv2.CAP_FFMPEG)
                 if not cap.isOpened() and isinstance(source_path, str) and "fbcdn.net" in source_path:
                     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
                         "headers;User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1402,7 +1907,7 @@ else:  # Realtime Analysis
                     if _stream_status not in ('live', 'vod_ready'):
                         st_error.error(f"❌ Cannot open — stream status is **{_stream_status}**. Only 🔴 LIVE or 📹 VOD (recorded) streams work in realtime.")
                     else:
-                        st_error.error(f"❌ Cannot connect to Booca stream. Check network or try again.")
+                        st_error.error(f"❌ Cannot connect to Booca stream. URL: `{source_path[:120]}`. OpenCV failed to read frame.")
                 else:
                     st_error.error(f"Cannot open: {source_path[:80]}")
             else:
@@ -1429,8 +1934,86 @@ else:  # Realtime Analysis
                     teams_assigned = False
                     frame_count = 0
                     _fps_start = time.time()
+                    
+                    # Initialize advanced analyzers for realtime
+                    rt_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                    rt_frame_h, rt_frame_w = frame.shape[:2]
+                    rt_speed_estimator = SpeedEstimator(fps=rt_fps)
+                    rt_tactical_analyzer = TacticalAnalyzer()
+                    rt_event_detector = EventDetector(frame_width=rt_frame_w, frame_height=rt_frame_h)
+                    rt_events_log = []
 
                     st_status.success("✅ Processing... Press Stop to end")
+                    
+                    # ================================================================
+                    # 📊 LIVE ANALYTICS DASHBOARD — Premium UI
+                    # ================================================================
+                    rt_theme = get_theme_mode()
+                    rt_is_dark = rt_theme == "dark"
+
+                    # --- Design tokens ---
+                    _card = "rgba(30,41,59,0.85)" if rt_is_dark else "rgba(255,255,255,0.92)"
+                    _card_border = "rgba(51,65,85,0.5)" if rt_is_dark else "rgba(226,232,240,0.8)"
+                    _glass = "backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);"
+                    _tp = "#f1f5f9" if rt_is_dark else "#0f172a"
+                    _ts = "#94a3b8" if rt_is_dark else "#64748b"
+                    _t3 = "#64748b" if rt_is_dark else "#94a3b8"
+                    _blue = "#3b82f6"
+                    _blue_g = "linear-gradient(135deg,#3b82f6,#60a5fa)"
+                    _red = "#ef4444"
+                    _green = "#22c55e"
+                    _amber = "#f59e0b"
+                    _purple = "#a855f7"
+                    _cyan = "#06b6d4"
+                    _divider = "rgba(148,163,184,0.15)"
+
+                    st.markdown("---")
+
+                    # Dashboard header with live pulse
+                    dash_header = f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;"><div style="width:4px;height:28px;background:{_blue_g};border-radius:2px;"></div><span style="color:{_tp};font-size:18px;font-weight:700;letter-spacing:-0.3px;">Live Match Analytics</span><span style="background:{_green};color:#fff;font-size:10px;font-weight:600;padding:2px 8px;border-radius:10px;text-transform:uppercase;letter-spacing:0.5px;">● LIVE</span></div>'
+                    st.markdown(dash_header, unsafe_allow_html=True)
+
+                    # Row 1: 3 metric cards
+                    rt_row1 = st.columns(3)
+                    rt_possession_placeholder = rt_row1[0].empty()
+                    rt_speed_placeholder = rt_row1[1].empty()
+                    rt_space_placeholder = rt_row1[2].empty()
+
+                    # Row 2: Events + AI Commentary
+                    rt_row2 = st.columns([1, 1])
+                    rt_events_placeholder = rt_row2[0].empty()
+                    rt_commentary_placeholder = rt_row2[1].empty()
+
+                    # Row 3: Player performance table
+                    rt_player_table_placeholder = st.empty()
+
+                    # Commentary generator
+                    def _gen_commentary(t1p, t2p, top_pl, evts, pl_cnt, f_cnt, fps_v):
+                        lines = []
+                        es = f_cnt / fps_v if fps_v > 0 else 0
+                        em, esec = int(es // 60), int(es % 60)
+                        if t1p > 65:
+                            lines.append(f"⚽ Team 1 đang kiểm soát bóng áp đảo với {t1p}% possession.")
+                        elif t2p > 65:
+                            lines.append(f"⚽ Team 2 đang thống trị quyền sở hữu bóng với {t2p}%.")
+                        elif abs(t1p - t2p) < 10:
+                            lines.append("⚖️ Hai đội đang cân bằng về khả năng kiểm soát bóng.")
+                        if top_pl and len(top_pl) > 0:
+                            t = top_pl[0]
+                            if t["speed"] > 25:
+                                lines.append(f"🔥 #{t['player_id']} đang sprint mạnh — {t['speed']} km/h!")
+                            elif t["speed"] > 18:
+                                lines.append(f"🏃 #{t['player_id']} dẫn đầu tốc độ với {t['speed']} km/h.")
+                        goals = [e for e in evts if e.get("event") == "goal"]
+                        passes = [e for e in evts if e.get("event") == "pass"]
+                        if goals:
+                            lines.append(f"🥅 BÀN THẮNG! Team {goals[-1].get('scoring_team','?')} ghi bàn!")
+                        if len(passes) > 10:
+                            lines.append(f"🔄 {len(passes)} đường chuyền — trận đấu sôi nổi!")
+                        elif len(passes) > 0:
+                            lines.append(f"📊 Đã phát hiện {len(passes)} đường chuyền.")
+                        lines.append(f"⏱ {em}:{esec:02d} — Đang theo dõi {pl_cnt} cầu thủ trên sân.")
+                        return lines
 
                     while cap.isOpened():
                         if not st.session_state.analysis_running:
@@ -1470,6 +2053,26 @@ else:  # Realtime Analysis
                             ball_possession_np = None
                         output_frame = tracker.draw_annotations_single_frame(frame, tracks, ball_possession_np)
                         output_frame = camera_movement_estimator.draw_camera_movement_single_frame(output_frame, camera_movement)
+                        
+                        # === Advanced realtime analytics ===
+                        rt_top_players = rt_speed_estimator.update_speeds(tracks, frame_count)
+                        rt_tactical_analyzer.update_heatmap(tracks)
+                        
+                        # Pass detection
+                        rt_current_possessor = None
+                        for pid, pdata in tracks.get("players", {}).items():
+                            if pdata.get("has_ball", False):
+                                rt_current_possessor = pid
+                                break
+                        rt_pass_evt = rt_tactical_analyzer.detect_passes(tracks, rt_current_possessor, frame_count)
+                        if rt_pass_evt:
+                            rt_events_log.append(rt_pass_evt)
+                        
+                        # Goal detection
+                        rt_goal_evt = rt_event_detector.check_events(tracks, frame_count)
+                        if rt_goal_evt:
+                            rt_goal_evt["frame"] = frame_count
+                            rt_events_log.append(rt_goal_evt)
 
                         # Push to broadcast server
                         if pusher is not None:
@@ -1490,11 +2093,160 @@ else:  # Realtime Analysis
                         display_frame = cv2.cvtColor(output_frame, cv2.COLOR_BGR2RGB)
                         st_frame.image(display_frame, channels="RGB")
 
-                        # Update status every 30 frames
+                        try:
+                            mm = render_minimap_rgb(tracks, width=320, height=180)
+                            st_minimap.image(
+                                mm,
+                                channels="RGB",
+                                caption="Minimap — bóng (vàng) & cầu thủ cầm bóng (viền theo đội)",
+                            )
+                        except Exception:
+                            pass
+
+                        # Update live stats every 30 frames
                         if frame_count % 30 == 0:
                             elapsed = time.time() - _fps_start
-                            fps = frame_count / elapsed if elapsed > 0 else 0
-                            st_debug_area.info(f"Frame {frame_count} | ~{fps:.1f} FPS")
+                            current_fps = frame_count / elapsed if elapsed > 0 else 0
+                            
+                            # --- Data prep ---
+                            rt_bp = player_assigner.ball_possession
+                            if rt_bp and len(rt_bp) > 0:
+                                rt_bp_arr = np.array([-1 if x is None else x for x in rt_bp])
+                                rt_t1 = int(np.sum(rt_bp_arr == 1))
+                                rt_t2 = int(np.sum(rt_bp_arr == 2))
+                                rt_total = rt_t1 + rt_t2
+                                rt_t1_pct = round(rt_t1 / rt_total * 100) if rt_total > 0 else 50
+                                rt_t2_pct = 100 - rt_t1_pct
+                            else:
+                                rt_t1_pct, rt_t2_pct = 50, 50
+
+                            # ═══════════════════════════════════════════
+                            # CARD 1: Possession
+                            # ═══════════════════════════════════════════
+                            poss_html = f'<div style="background:{_card};border:1px solid {_card_border};border-radius:14px;padding:18px 16px;{_glass}position:relative;overflow:hidden;">'
+                            poss_html += f'<div style="position:absolute;top:0;left:0;right:0;height:3px;background:{_blue_g};"></div>'
+                            poss_html += f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:14px;"><span style="font-size:14px;">⚽</span><span style="color:{_tp};font-weight:700;font-size:13px;letter-spacing:-0.2px;">Ball Possession</span></div>'
+                            poss_html += f'<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:10px;">'
+                            poss_html += f'<div style="text-align:center;"><div style="color:{_blue};font-weight:800;font-size:28px;line-height:1;">{rt_t1_pct}%</div><div style="color:{_ts};font-size:10px;margin-top:2px;text-transform:uppercase;letter-spacing:0.8px;">Team 1</div></div>'
+                            poss_html += f'<div style="color:{_t3};font-size:11px;font-weight:500;">VS</div>'
+                            poss_html += f'<div style="text-align:center;"><div style="color:{_red};font-weight:800;font-size:28px;line-height:1;">{rt_t2_pct}%</div><div style="color:{_ts};font-size:10px;margin-top:2px;text-transform:uppercase;letter-spacing:0.8px;">Team 2</div></div></div>'
+                            poss_html += f'<div style="background:rgba(148,163,184,0.15);border-radius:6px;height:10px;overflow:hidden;">'
+                            poss_html += f'<div style="background:{_blue_g};height:100%;width:{rt_t1_pct}%;border-radius:6px;box-shadow:0 0 8px rgba(59,130,246,0.4);"></div></div></div>'
+                            rt_possession_placeholder.markdown(poss_html, unsafe_allow_html=True)
+
+                            # ═══════════════════════════════════════════
+                            # CARD 2: Top Speeds
+                            # ═══════════════════════════════════════════
+                            speed_html = f'<div style="background:{_card};border:1px solid {_card_border};border-radius:14px;padding:18px 16px;{_glass}position:relative;overflow:hidden;">'
+                            speed_html += f'<div style="position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(135deg,{_amber},{_green});"></div>'
+                            speed_html += f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:14px;"><span style="font-size:14px;">🏃</span><span style="color:{_tp};font-weight:700;font-size:13px;letter-spacing:-0.2px;">Top Speeds</span></div>'
+                            if rt_top_players:
+                                medals = ["🥇", "🥈", "🥉", ""]
+                                for idx, tp in enumerate(rt_top_players[:4]):
+                                    t_color = _blue if tp["team"] == 1 else _red
+                                    bar_pct = min(tp["speed"] / 35 * 100, 100)
+                                    medal = medals[min(idx, 3)]
+                                    speed_html += f'<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid {_divider};">'
+                                    speed_html += f'<span style="font-size:12px;width:16px;">{medal}</span>'
+                                    speed_html += f'<span style="color:{t_color};font-size:11px;font-weight:600;width:30px;">#{tp["player_id"]}</span>'
+                                    speed_html += f'<div style="flex:1;background:rgba(148,163,184,0.1);border-radius:3px;height:6px;overflow:hidden;"><div style="background:{t_color};height:100%;width:{bar_pct}%;border-radius:3px;"></div></div>'
+                                    speed_html += f'<span style="color:{_tp};font-size:11px;font-weight:700;min-width:52px;text-align:right;">{tp["speed"]} km/h</span></div>'
+                            else:
+                                speed_html += f'<div style="color:{_ts};font-size:12px;text-align:center;padding:10px 0;">⏳ Measuring...</div>'
+                            speed_html += '</div>'
+                            rt_speed_placeholder.markdown(speed_html, unsafe_allow_html=True)
+
+                            # ═══════════════════════════════════════════
+                            # CARD 3: Space Control + Formations
+                            # ═══════════════════════════════════════════
+                            rt_tactics = rt_tactical_analyzer.analyze_tactics(tracks)
+                            rt_sc = rt_tactics.get("space_control", {"team1": 50.0, "team2": 50.0})
+                            rt_formations = rt_tactics.get("formations", {})
+                            rt_f1 = rt_formations.get(1, 'N/A')
+                            rt_f2 = rt_formations.get(2, 'N/A')
+
+                            space_html = f'<div style="background:{_card};border:1px solid {_card_border};border-radius:14px;padding:18px 16px;{_glass}position:relative;overflow:hidden;">'
+                            space_html += f'<div style="position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(135deg,{_purple},{_cyan});"></div>'
+                            space_html += f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:14px;"><span style="font-size:14px;">🗺️</span><span style="color:{_tp};font-weight:700;font-size:13px;letter-spacing:-0.2px;">Space Control</span></div>'
+                            space_html += f'<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:10px;">'
+                            space_html += f'<div style="text-align:center;"><div style="color:{_blue};font-weight:800;font-size:22px;line-height:1;">{rt_sc["team1"]}%</div></div>'
+                            space_html += f'<div style="color:{_t3};font-size:11px;font-weight:500;">VS</div>'
+                            space_html += f'<div style="text-align:center;"><div style="color:{_red};font-weight:800;font-size:22px;line-height:1;">{rt_sc["team2"]}%</div></div></div>'
+                            space_html += f'<div style="background:rgba(148,163,184,0.15);border-radius:6px;height:10px;overflow:hidden;">'
+                            space_html += f'<div style="background:{_blue_g};height:100%;width:{rt_sc["team1"]}%;border-radius:6px;"></div></div>'
+                            space_html += f'<div style="display:flex;justify-content:space-between;margin-top:8px;">'
+                            space_html += f'<div style="background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.2);border-radius:6px;padding:3px 8px;"><span style="color:{_blue};font-size:10px;font-weight:600;">🔵 {rt_f1}</span></div>'
+                            space_html += f'<div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:6px;padding:3px 8px;"><span style="color:{_red};font-size:10px;font-weight:600;">🔴 {rt_f2}</span></div></div></div>'
+                            rt_space_placeholder.markdown(space_html, unsafe_allow_html=True)
+
+                            # ═══════════════════════════════════════════
+                            # CARD 4: Events Feed
+                            # ═══════════════════════════════════════════
+                            rt_t1_passes = sum(1 for e in rt_events_log if e.get("event") == "pass" and e.get("scoring_team", e.get("scoringTeam")) == 1)
+                            rt_t2_passes = sum(1 for e in rt_events_log if e.get("event") == "pass" and e.get("scoring_team", e.get("scoringTeam")) == 2)
+                            rt_t1_goals = sum(1 for e in rt_events_log if e.get("event") == "goal" and e.get("scoring_team") == 1)
+                            rt_t2_goals = sum(1 for e in rt_events_log if e.get("event") == "goal" and e.get("scoring_team") == 2)
+
+                            evt_html = f'<div style="background:{_card};border:1px solid {_card_border};border-radius:14px;padding:18px 16px;{_glass}position:relative;overflow:hidden;min-height:200px;">'
+                            evt_html += f'<div style="position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(135deg,{_green},{_amber});"></div>'
+                            evt_html += f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:14px;"><span style="font-size:14px;">📋</span><span style="color:{_tp};font-weight:700;font-size:13px;letter-spacing:-0.2px;">Match Events</span><span style="margin-left:auto;background:rgba(148,163,184,0.15);color:{_ts};font-size:10px;padding:2px 6px;border-radius:8px;">{len(rt_events_log)} total</span></div>'
+                            evt_html += f'<div style="display:flex;gap:12px;margin-bottom:12px;">'
+                            evt_html += f'<div style="flex:1;background:rgba(59,130,246,0.08);border-radius:8px;padding:8px;text-align:center;"><div style="color:{_blue};font-size:18px;font-weight:800;">{rt_t1_goals}</div><div style="color:{_ts};font-size:9px;text-transform:uppercase;">Goals T1</div></div>'
+                            evt_html += f'<div style="flex:1;background:rgba(239,68,68,0.08);border-radius:8px;padding:8px;text-align:center;"><div style="color:{_red};font-size:18px;font-weight:800;">{rt_t2_goals}</div><div style="color:{_ts};font-size:9px;text-transform:uppercase;">Goals T2</div></div></div>'
+                            evt_html += f'<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid {_divider};"><span style="color:{_ts};font-size:11px;">🔄 Passes</span><span style="color:{_tp};font-size:11px;font-weight:600;"><span style="color:{_blue}">{rt_t1_passes}</span> — <span style="color:{_red}">{rt_t2_passes}</span></span></div>'
+                            evt_html += f'<div style="display:flex;justify-content:space-between;padding:4px 0;"><span style="color:{_ts};font-size:11px;">📊 On Field</span><span style="color:{_tp};font-size:11px;font-weight:600;">{len(players_in_frame)} players · {current_fps:.0f} FPS</span></div>'
+                            for evt in rt_events_log[-3:]:
+                                etype = evt.get("event", "")
+                                if etype == "goal":
+                                    evt_html += f'<div style="margin-top:6px;background:rgba(34,197,94,0.1);border-left:3px solid {_green};padding:4px 8px;border-radius:0 6px 6px 0;"><span style="color:{_green};font-size:11px;font-weight:600;">⚽ GOAL — Team {evt.get("scoring_team","?")}</span></div>'
+                                elif etype == "pass":
+                                    evt_html += f'<div style="margin-top:4px;padding-left:8px;"><span style="color:{_t3};font-size:10px;">🔄 #{evt.get("from_player","?")} → #{evt.get("to_player","?")}</span></div>'
+                            evt_html += '</div>'
+                            rt_events_placeholder.markdown(evt_html, unsafe_allow_html=True)
+
+                            # ═══════════════════════════════════════════
+                            # CARD 5: AI Automated Commentary
+                            # ═══════════════════════════════════════════
+                            rt_comm_lines = _gen_commentary(rt_t1_pct, rt_t2_pct, rt_top_players, rt_events_log, len(players_in_frame), frame_count, rt_fps)
+                            comm_html = f'<div style="background:{_card};border:1px solid {_card_border};border-radius:14px;padding:18px 16px;{_glass}position:relative;overflow:hidden;min-height:200px;">'
+                            comm_html += f'<div style="position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(135deg,{_cyan},#818cf8);"></div>'
+                            comm_html += f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:12px;"><span style="font-size:14px;">🤖</span><span style="color:{_tp};font-weight:700;font-size:13px;letter-spacing:-0.2px;">AI Commentary</span><span style="margin-left:auto;color:{_cyan};font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Auto</span></div>'
+                            for cl in rt_comm_lines:
+                                comm_html += f'<div style="color:{_ts};font-size:11px;line-height:1.6;padding:3px 0;border-bottom:1px solid {_divider};">{cl}</div>'
+                            if not rt_comm_lines:
+                                comm_html += f'<div style="color:{_t3};font-size:11px;text-align:center;padding:16px 0;">Đang phân tích trận đấu...</div>'
+                            comm_html += '</div>'
+                            rt_commentary_placeholder.markdown(comm_html, unsafe_allow_html=True)
+
+                            # ═══════════════════════════════════════════
+                            # Player Performance Table (every 90 frames)
+                            # ═══════════════════════════════════════════
+                            if frame_count % 90 == 0 and rt_speed_estimator.total_distances:
+                                rt_sorted = sorted(
+                                    rt_speed_estimator.total_distances.items(),
+                                    key=lambda x: x[1],
+                                    reverse=True
+                                )[:10]
+
+                                rt_perf_data = []
+                                for rk, (pid, dist) in enumerate(rt_sorted, 1):
+                                    p_team = tracks.get("players", {}).get(pid, {}).get("team", "?")
+                                    t_label = "🔵 T1" if p_team == 1 else "🔴 T2" if p_team == 2 else "⚪"
+                                    rt_perf_data.append({
+                                        "#": rk,
+                                        "ID": int(pid),
+                                        "Team": t_label,
+                                        "Dist(m)": f"{dist * rt_speed_estimator.pixel_to_meter_scale:.0f}" if dist < 100 else f"{dist:.0f}",
+                                        "Speed": f"{rt_speed_estimator.current_speeds.get(pid, 0):.1f}",
+                                        "Sprints": rt_speed_estimator.sprint_counts.get(pid, 0),
+                                    })
+
+                                if rt_perf_data:
+                                    import pandas as _pd_rt
+                                    rt_perf_df = _pd_rt.DataFrame(rt_perf_data)
+                                    rt_player_table_placeholder.dataframe(rt_perf_df, use_container_width=True, hide_index=True)
+
+
 
                     cap.release()
                     st_debug_area.info("⏹️ Stopped")
