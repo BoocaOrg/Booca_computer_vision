@@ -101,8 +101,12 @@ def ball_possession_box(frame_num: int, frame: np.ndarray, ball_possession: np.n
 
     total = _team1_frames + _team2_frames
 
-    team_1_possession = int(round(_team1_frames / total, 2) * 100)
-    team_2_possession = int(round(_team2_frames / total, 2) * 100)
+    if total > 0:
+        team_1_possession = int(round(_team1_frames / total, 2) * 100)
+        team_2_possession = int(round(_team2_frames / total, 2) * 100)
+    else:
+        team_1_possession = 0
+        team_2_possession = 0
 
     cv2.putText(frame, text=f"Team 1: {team_1_possession}%", org=(1400, 900), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, color=(0, 0, 0), thickness=3)
     cv2.putText(frame, text=f"Team 2: {team_2_possession}%", org=(1400, 950), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, color=(0, 0, 0), thickness=3)

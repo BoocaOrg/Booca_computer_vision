@@ -93,14 +93,17 @@ class TeamAssigner:
         Called in main.
         Adds keys to tracks.
         """
-        # only assign teams if players found/player tracking selected
-        if len(tracks["players"][0]) > 0:  # default empty: [{}]
-            self.assign_team_colour(frames[0], tracks["players"][0])
+        # Initialize team colors from the first frame that has players
+        for frame_num, player_dict in enumerate(tracks["players"]):
+            if len(player_dict) > 0:
+                self.assign_team_colour(frames[frame_num], player_dict, force=True)
+                break
 
-            for frame_num, player in enumerate(tracks["players"]):
-                for player_id, player_track in player.items():
-                    team = self.get_player_team(frames[frame_num], player_track["bbox"], player_id)
+        for frame_num, player in enumerate(tracks["players"]):
+            for player_id, player_track in player.items():
+                team = self.get_player_team(frames[frame_num], player_track["bbox"], player_id)
 
-                    # add new keys team and team_colour
-                    tracks["players"][frame_num][player_id]["team"] = team
-                    tracks["players"][frame_num][player_id]["team_colour"] = self.team_colours[team]
+                # add new keys team and team_colour
+                tracks["players"][frame_num][player_id]["team"] = team
+                # Fallback to white if team_colour is not available for some reason
+                tracks["players"][frame_num][player_id]["team_colour"] = self.team_colours.get(team, np.array([255, 255, 255]))

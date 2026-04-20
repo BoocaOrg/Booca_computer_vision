@@ -18,6 +18,8 @@ import struct
 import sys
 import sys
 import os
+from urllib.parse import urlparse
+import random
 
 # Add project root to path so we can import MatchVision modules
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +33,7 @@ from cv_service.event_detector import EventDetector
 from cv_service.speed_estimator import SpeedEstimator
 from cv_service.tactical_analyzer import TacticalAnalyzer
 from cv_service.ocr_reader import JerseyOCRReader
+from cv_service.calibration import PitchCalibrator
 
 # ─────────────────────────────────────────────
 # FastAPI app
@@ -63,6 +66,9 @@ class StartRequest(BaseModel):
     hls_url: str
     booca_callback_url: str
     features: List[str] = ["possession", "players", "events"]
+    # Optional: protect /cv/start in production without changing callers that don't pass it.
+    # When CV_START_TOKEN is set, requests MUST include this token.
+    token: Optional[str] = None
 
 
 class SessionInfo(BaseModel):
@@ -104,7 +110,14 @@ async def get_status():
 
 @app.post("/cv/start")
 async def start_analysis(req: StartRequest, background_tasks: BackgroundTasks):
+    required = os.getenv("CV_START_TOKEN")
+    if required and (req.token != required):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    max_sessions = int(os.getenv("CV_MAX_ACTIVE_SESSIONS", "2"))
     with _lock:
+        if len(active_sessions) >= max_sessions:
+            raise HTTPException(status_code=429, detail="Too many active sessions")
         if req.stream_id in active_sessions:
             return {"status": "already_running", "stream_id": req.stream_id}
 
@@ -193,25 +206,84 @@ def _run_cv_pipeline(
     stop_event: threading.Event,
 ):
     """Main CV loop — reads HLS, detects, tracks, collects stats, POSTs back."""
+    try:
+        _run_cv_pipeline_inner(stream_id, hls_url, callback_url, features, stop_event)
+    except Exception as e:
+        import traceback
+        print(f"[CV] FATAL ERROR in pipeline for stream={stream_id}: {e}")
+        traceback.print_exc()
+        _cleanup_session(stream_id)
+
+
+def _run_cv_pipeline_inner(
+    stream_id: str,
+    hls_url: str,
+    callback_url: str,
+    features: List[str],
+    stop_event: threading.Event,
+):
+    """Inner pipeline logic — wrapped by _run_cv_pipeline for error handling."""
+    parsed = urlparse(hls_url)
+    hls_host = parsed.netloc or parsed.hostname or ""
     print(f"[CV] Starting pipeline for stream={stream_id}")
     print(f"[CV]   HLS: {hls_url}")
+    if hls_host:
+        print(f"[CV]   HLS host: {hls_host}")
     print(f"[CV]   Callback: {callback_url}")
 
-    cap = cv2.VideoCapture(hls_url)
-    if not cap.isOpened():
-        print(f"[CV] ERROR: Cannot open HLS stream: {hls_url}")
+    is_hls = hls_url.endswith(".m3u8") or ".m3u8?" in hls_url
+
+    # ── Check if FFmpeg binary is available ──
+    ffmpeg_available = _check_ffmpeg_available()
+    print(f"[CV] FFmpeg binary available: {ffmpeg_available}")
+
+    # ── Open stream ──
+    if is_hls and ffmpeg_available:
+        # Use FFmpeg pipe for HLS stability
+        print(f"[CV] Using FFmpeg pipe for HLS stream")
+        cap, meta = _get_ffmpeg_reader(hls_url)
+        if cap is None:
+            print(f"[CV] FFmpeg reader failed, falling back to cv2.VideoCapture")
+            cap, meta = _open_hls_via_cv2(hls_url)
+    elif is_hls:
+        # No FFmpeg binary — use cv2.VideoCapture directly (OpenCV has built-in FFmpeg)
+        print(f"[CV] No FFmpeg binary — using cv2.VideoCapture directly for HLS")
+        cap, meta = _open_hls_via_cv2(hls_url)
+    else:
+        cap = cv2.VideoCapture(hls_url)
+        meta = _get_cv2_metadata(cap) if cap.isOpened() else None
+
+    if cap is None or (not getattr(cap, '_is_ffmpeg_pipe', False) and not cap.isOpened()):
+        print(f"[CV] ERROR: Cannot open stream: {hls_url}")
         _cleanup_session(stream_id)
         return
 
-    ret, frame = cap.read()
-    if not ret:
-        print(f"[CV] ERROR: Cannot read first frame for {stream_id}")
-        cap.release()
-        _cleanup_session(stream_id)
-        return
+    is_ffmpeg_pipe = getattr(cap, "_is_ffmpeg_pipe", False)
+    proc = getattr(cap, "_ffmpeg_proc", None) if is_ffmpeg_pipe else None
+    fps = meta.get("fps", 30) if meta else 30
+    fw = meta.get("width", 1920) if meta else 1920
+    fh = meta.get("height", 1080) if meta else 1080
+    frame_size = fw * fh * 3
 
-    # Get frame dimensions for event detector
-    fh, fw = frame.shape[:2]
+    # ── Read first frame ──
+    if is_ffmpeg_pipe and proc:
+        raw = proc.stdout.read(frame_size)
+        if len(raw) < frame_size:
+            print(f"[CV] ERROR: Cannot read first frame from FFmpeg pipe")
+            proc.terminate()
+            _cleanup_session(stream_id)
+            return
+        frame = np.frombuffer(raw, dtype=np.uint8).reshape(fh, fw, 3)
+    else:
+        ret, frame = cap.read()
+        if not ret:
+            print(f"[CV] ERROR: Cannot read first frame for {stream_id}")
+            cap.release()
+            _cleanup_session(stream_id)
+            return
+        fh, fw = frame.shape[:2]
+
+    print(f"[CV] First frame read successfully: {fw}x{fh}")
 
     # Init CV modules (same as realtime_main.py)
     tracker = Tracker(MODEL_PATH, [0, 1, 2, 3], verbose=False)
@@ -219,30 +291,79 @@ def _run_cv_pipeline(
     t_assign = TeamAssigner()
     b_assign = PlayerBallAssigner()
     ev_detect = EventDetector(fw, fh) if "events" in features else None
-    speed_est = SpeedEstimator(fps=30)
+    # Auto-calibrate pixel_to_meter_scale from first frame (#3)
+    calibrator = PitchCalibrator()
+    px_to_m_scale = calibrator.calibrate_from_frame(frame)
+    print(f"[CV] Calibrated pixel_to_meter_scale = {px_to_m_scale:.5f} (calibrated={calibrator.is_calibrated})")
+
+    speed_est = SpeedEstimator(fps=fps, pixel_to_meter_scale=px_to_m_scale)
     tact_analyzer = TacticalAnalyzer()
     ocr_reader = JerseyOCRReader(min_bbox_height=150)
 
     teams_assigned = False
     frame_count = 0
     last_post_time = 0.0
-    POST_INTERVAL = 2.0  # seconds between stats posts
+    # Outbound control knobs
+    POST_INTERVAL = float(os.getenv("CV_POST_INTERVAL_SEC", "2.0"))  # seconds between stats posts
+    FRAME_MOD = int(os.getenv("CV_PROCESS_EVERY_N_FRAMES", "2"))  # process every Nth frame (>=1)
+    FRAME_MOD = max(1, FRAME_MOD)
     reconnect_attempts = 0
-    MAX_RECONNECT = 5
+    # Reconnect/backoff controls (reduce bursty outbound when stream is flaky)
+    MAX_RECONNECT = int(os.getenv("CV_HLS_MAX_RECONNECT", "6"))
+    BACKOFF_BASE_SEC = float(os.getenv("CV_HLS_RECONNECT_BASE_SLEEP", "2.0"))
+    BACKOFF_MAX_SEC = float(os.getenv("CV_HLS_RECONNECT_MAX_SLEEP", "30.0"))
 
-    print(f"[CV] Pipeline running for stream={stream_id} ({fw}x{fh})")
+    print(f"[CV] Pipeline running for stream={stream_id} ({fw}x{fh}, {fps:.1f}fps, ffmpeg={is_ffmpeg_pipe})")
 
     while not stop_event.is_set():
-        ret, frame = cap.read()
-        if not ret:
+        # ── Read frame (FFmpeg pipe or cv2) ──
+        read_ok = False
+        if is_ffmpeg_pipe and proc:
+            raw = proc.stdout.read(frame_size)
+            if len(raw) >= frame_size:
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(fh, fw, 3)
+                read_ok = True
+        elif cap is not None:
+            ret, frame = cap.read()
+            read_ok = ret
+
+        if not read_ok:
             reconnect_attempts += 1
             if reconnect_attempts > MAX_RECONNECT:
-                print(f"[CV] Max reconnect attempts reached for {stream_id}")
+                print(f"[CV] Max reconnect attempts reached for stream={stream_id}. Stopping session to avoid outbound flood.")
                 break
-            print(f"[CV] Reconnecting ({reconnect_attempts}/{MAX_RECONNECT})...")
-            time.sleep(2)
-            cap.release()
-            cap = cv2.VideoCapture(hls_url)
+
+            # Exponential backoff + jitter
+            sleep_s = min(BACKOFF_MAX_SEC, BACKOFF_BASE_SEC * (2 ** (reconnect_attempts - 1)))
+            sleep_s = sleep_s + random.uniform(0, min(1.0, sleep_s * 0.1))
+            print(
+                f"[CV] Reconnecting stream={stream_id} ({reconnect_attempts}/{MAX_RECONNECT}) "
+                f"after {sleep_s:.1f}s (host={hls_host or '?'})..."
+            )
+            # Cleanup old resources
+            if proc:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+                proc = None
+            elif cap is not None:
+                cap.release()
+            time.sleep(sleep_s)
+            # Reconnect using FFmpeg for HLS, cv2 otherwise
+            if is_hls:
+                new_cap, new_meta = _get_ffmpeg_reader(hls_url)
+                if new_cap is not None:
+                    cap = new_cap
+                    is_ffmpeg_pipe = getattr(cap, "_is_ffmpeg_pipe", False)
+                    proc = getattr(cap, "_ffmpeg_proc", None) if is_ffmpeg_pipe else None
+                    if new_meta:
+                        fw = new_meta.get("width", fw)
+                        fh = new_meta.get("height", fh)
+                        frame_size = fw * fh * 3
+            else:
+                cap = cv2.VideoCapture(hls_url)
             continue
 
         reconnect_attempts = 0
@@ -253,11 +374,16 @@ def _run_cv_pipeline(
             if stream_id in active_sessions:
                 active_sessions[stream_id]["frame_count"] = frame_count
 
-        # Skip odd frames to reduce CPU load
-        if frame_count % 2 != 0:
+        # Process only every Nth frame to reduce CPU + outbound callback volume
+        if frame_count % FRAME_MOD != 0:
             continue
 
         try:
+            # ── Periodic recalibration (#3) ──
+            new_scale = calibrator.recalibrate_if_needed(frame, frame_count, interval=3000)
+            if new_scale != speed_est.pixel_to_meter_scale:
+                speed_est.update_scale(new_scale)
+
             # ── Detection & Tracking ──
             tracks = tracker.get_object_tracks_single_frame(frame)
             tracker.add_position_to_tracks_single_frame(tracks)
@@ -288,8 +414,10 @@ def _run_cv_pipeline(
             # Speed Estimation (Update every frame to build history)
             top_speeds = speed_est.update_speeds(tracks, frame_count)
             
-            # Pass Detection 
+            # Tactics & Passes & Heatmap
+            tact_analyzer.update_heatmap(tracks)
             pass_event = tact_analyzer.detect_passes(tracks, b_assign.player_has_ball, frame_count)
+            tactics_info = tact_analyzer.analyze_tactics(tracks)
 
             # OCR Jersey Numbers (runs only on large bboxes)
             jersey_map = ocr_reader.process_frame(frame, tracks, frame_count)
@@ -297,22 +425,34 @@ def _run_cv_pipeline(
             if now - last_post_time >= POST_INTERVAL:
                 last_post_time = now
 
-                stats = _collect_stats(tracks, b_assign, ev_detect, features, frame_count, top_speeds, pass_event)
+                stats = _collect_stats(tracks, b_assign, ev_detect, features, frame_count, top_speeds, pass_event, tactics_info, jersey_map, fps)
 
                 try:
-                    requests.post(
+                    r = requests.post(
                         callback_url,
                         json={"stream_id": stream_id, "frame": frame_count, **stats},
                         timeout=2,
                     )
+                    if frame_count <= 6 or r.status_code >= 400:
+                        print(f"[CV] Callback → {callback_url} HTTP {r.status_code}")
                 except Exception as e:
-                    print(f"[CV] POST callback failed: {e}")
+                    print(f"[CV] POST callback failed ({callback_url}): {e}")
 
         except Exception as e:
             print(f"[CV] Frame {frame_count} error: {e}")
             continue
 
-    cap.release()
+    # Cleanup resources
+    if is_ffmpeg_pipe and proc:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+    try:
+        cap.release()
+    except Exception:
+        pass
     _cleanup_session(stream_id)
     print(f"[CV] Pipeline stopped for stream={stream_id} (processed {frame_count} frames)")
 
@@ -324,10 +464,15 @@ def _collect_stats(
     features: List[str],
     frame_count: int,
     top_speeds: list = None,
-    pass_event: dict = None
+    pass_event: dict = None,
+    tactics_info: dict = None,
+    jersey_map: dict = None,
+    fps: float = 30.0,
 ) -> Dict:
     """Collect stats from current CV state."""
     stats: Dict = {}
+    # Match elapsed time in seconds (#10 — accurate timing instead of wall clock)
+    stats["match_elapsed"] = round(frame_count / fps, 1)
     players = tracks.get("players", {})
 
     # ── Possession ──
@@ -352,6 +497,43 @@ def _collect_stats(
             "ball_visible": ball_visible,
         }
 
+    # ── Ball + Possessor (for minimap) ──
+    # Provide normalized 0..1 coordinates from observed player field bounds (same bounds TacticalAnalyzer uses).
+    try:
+        ball = tracks.get("ball", {})
+        if ball and 1 in ball:
+            bx1, by1, bx2, by2 = ball[1].get("bbox", [0, 0, 0, 0])
+            bx = float((bx1 + bx2) / 2.0)
+            by = float((by1 + by2) / 2.0)
+
+            xs = [p["position_adjusted"][0] for p in players.values() if "position_adjusted" in p]
+            ys = [p["position_adjusted"][1] for p in players.values() if "position_adjusted" in p]
+            if xs and ys:
+                min_x, max_x = float(min(xs)), float(max(xs))
+                min_y, max_y = float(min(ys)), float(max(ys))
+                rx = max(1.0, max_x - min_x)
+                ry = max(1.0, max_y - min_y)
+                stats["ball"] = {
+                    "x": round((bx - min_x) / rx, 4),
+                    "y": round((by - min_y) / ry, 4),
+                    "visible": True,
+                }
+            else:
+                stats["ball"] = {"visible": True}
+        else:
+            stats["ball"] = {"visible": False}
+
+        if getattr(b_assign, "player_has_ball", None) is not None:
+            pid = int(b_assign.player_has_ball)
+            pdata = players.get(pid, {}) if isinstance(players, dict) else {}
+            stats["possessor"] = {
+                "player_id": pid,
+                "team": int(pdata.get("team", 0) or 0),
+            }
+    except Exception:
+        # Never break callback due to minimap extras
+        pass
+
     # ── Events ──
     if "events" in features and ev_detect is not None:
         event = ev_detect.check_events(tracks, frame_count)
@@ -361,9 +543,18 @@ def _collect_stats(
         if pass_event:
             stats["event"] = pass_event
 
-    # ── Speeds ──
+    # ── Speeds & Distance ──
     if top_speeds:
         stats["speeds"] = top_speeds
+
+    # ── Tactics & Space Control ──
+    if tactics_info:
+        stats["tactics"] = tactics_info
+
+    # ── Jersey Number Mapping (OCR) ──
+    if jersey_map:
+        # Convert int keys to strings for JSON serialization
+        stats["jerseys"] = {str(k): v for k, v in jersey_map.items()}
 
     return stats
 
@@ -375,6 +566,51 @@ def _cleanup_session(stream_id: str):
 
 
 # ─────────────────────────────────────────────
+# FFmpeg availability check
+# ─────────────────────────────────────────────
+def _check_ffmpeg_available() -> bool:
+    """Check if FFmpeg binary is available in PATH."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+# ─────────────────────────────────────────────
+# Direct cv2 HLS reader (fallback when FFmpeg binary unavailable)
+# ─────────────────────────────────────────────
+def _open_hls_via_cv2(video_url: str) -> Tuple[Optional[cv2.VideoCapture], Optional[dict]]:
+    """
+    Open an HLS stream directly via cv2.VideoCapture.
+    OpenCV's built-in FFmpeg backend can read .m3u8 URLs.
+    Sets OPENCV_FFMPEG_CAPTURE_OPTIONS for referer header if needed.
+    """
+    import os
+    # Set referer header for BunnyCDN streams
+    os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'referer;https://booca.online/'
+    print(f"[CV] Opening HLS via cv2.VideoCapture: {video_url}")
+    cap = cv2.VideoCapture(video_url, cv2.CAP_FFMPEG)
+    if cap.isOpened():
+        meta = _get_cv2_metadata(cap)
+        print(f"[CV] cv2.VideoCapture opened successfully: {meta['width']}x{meta['height']}, {meta['fps']:.1f}fps")
+        return cap, meta
+    # Try without explicit backend
+    print(f"[CV] CAP_FFMPEG failed, trying default backend...")
+    cap = cv2.VideoCapture(video_url)
+    if cap.isOpened():
+        meta = _get_cv2_metadata(cap)
+        print(f"[CV] Default backend opened successfully: {meta['width']}x{meta['height']}, {meta['fps']:.1f}fps")
+        return cap, meta
+    print(f"[CV] ERROR: cv2.VideoCapture cannot open HLS: {video_url}")
+    return None, None
+
+
+# ─────────────────────────────────────────────
 # FFmpeg Frame Reader (supports HLS + MP4)
 # ─────────────────────────────────────────────
 def _get_ffmpeg_reader(video_url: str) -> Tuple[Optional[cv2.VideoCapture], Optional[dict]]:
@@ -383,13 +619,18 @@ def _get_ffmpeg_reader(video_url: str) -> Tuple[Optional[cv2.VideoCapture], Opti
     Returns (cap, metadata) where metadata has fps, width, height, total_frames.
     Falls back to plain cv2.VideoCapture if FFmpeg pipe fails.
     """
+    from cv_service.hls_proxy import get_hls_proxy
     is_hls = video_url.endswith(".m3u8") or ".m3u8?" in video_url
 
     if is_hls:
-        # Use FFmpeg pipe: decode HLS to raw frames
+        orig_video_url = video_url
+        # Pass to local proxy to append Referer to all manifest and TS segment requests
+        proxy_url = get_hls_proxy().get_proxy_url(video_url)
+        headers_str = "Referer: https://booca.online/\r\nUser-Agent: Mozilla/5.0\r\n"
         ffmpeg_cmd = [
-            "ffmpeg", "-reconnect", "1", "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5", "-i", video_url,
+            "ffmpeg", "-headers", headers_str,
+            "-reconnect", "1", "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5", "-i", proxy_url,
             "-f", "rawvideo", "-pix_fmt", "bgr24", "-"
         ]
         try:
@@ -401,9 +642,10 @@ def _get_ffmpeg_reader(video_url: str) -> Tuple[Optional[cv2.VideoCapture], Opti
             # Get metadata via ffprobe
             probe_cmd = [
                 "ffprobe", "-v", "error",
+                "-headers", headers_str,
                 "-select_streams", "v:0",
                 "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
-                "-of", "default=noprint_wrappers=1", video_url
+                "-of", "default=noprint_wrappers=1", proxy_url
             ]
             probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
             meta = {}
@@ -428,18 +670,14 @@ def _get_ffmpeg_reader(video_url: str) -> Tuple[Optional[cv2.VideoCapture], Opti
                 "proc": proc,
             }
             # Return a dummy cap with metadata attached; real reading via proc
-            cap = cv2.VideoCapture(video_url)  # dummy, will be overridden
+            cap = cv2.VideoCapture(orig_video_url)  # dummy, will be overridden
             cap._ffmpeg_proc = proc  # type: ignore
             cap._ffmpeg_meta = metadata  # type: ignore
             cap._is_ffmpeg_pipe = True  # type: ignore
             return cap, metadata
         except Exception as e:
-            print(f"[CV-VOD] FFmpeg pipe failed for HLS: {e}, falling back to cv2")
-            cap = cv2.VideoCapture(video_url)
-            if cap.isOpened():
-                meta = _get_cv2_metadata(cap)
-                return cap, meta
-            return None, None
+            print(f"[CV] FFmpeg pipe failed for HLS: {e}, falling back to cv2")
+            return _open_hls_via_cv2(orig_video_url)
     else:
         cap = cv2.VideoCapture(video_url)
         if cap.isOpened():

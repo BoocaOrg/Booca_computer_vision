@@ -49,7 +49,7 @@ class Tracker:
         else:
             self.model = ultralytics.YOLO(model_path)
             self.model_type = "pytorch"
-            self.fp16 = fp16 and get_device() == "cuda"
+            self.fp16 = False  # Fixed: fp16 causes expected m1 and m2 to have the same dtype error
             if self.fp16:
                 self.model.half()
             if verbose:

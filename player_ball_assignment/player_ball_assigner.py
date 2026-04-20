@@ -6,6 +6,7 @@ class PlayerBallAssigner():
     def __init__(self) -> None:
         self.max_player_ball_distance = 70  # pixels
         self.ball_possession = None
+        self.player_has_ball = None
 
     def assign_ball_to_player(self, player_tracks: Dict, ball_bbox: List[float]) -> int:
         ball_position = get_center_of_bbox(ball_bbox)
@@ -37,6 +38,8 @@ class PlayerBallAssigner():
             if not ball_frame or 1 not in ball_frame:
                 if len(ball_possession) > 0:
                     ball_possession.append(ball_possession[-1])
+                else:
+                    ball_possession.append(0)
                 continue
 
             ball_bbox = ball_frame[1]["bbox"]
@@ -45,9 +48,12 @@ class PlayerBallAssigner():
             if assigned_player != -1:
                 # add new key has_ball
                 tracks["players"][frame_num][assigned_player]["has_ball"] = True
-                ball_possession.append(tracks["players"][frame_num][assigned_player]["team"])
+                team = tracks["players"][frame_num][assigned_player].get("team", 0)
+                ball_possession.append(team)
             elif len(ball_possession) > 0:
                 ball_possession.append(ball_possession[-1])
+            else:
+                ball_possession.append(0)
 
         # ball possession counter in ball_possession_box() requires numpy array
         ball_possession = np.array(ball_possession) if ball_possession else np.array([])
@@ -63,6 +69,9 @@ class PlayerBallAssigner():
         if self.ball_possession is None:
             self.ball_possession = []
         
+        # Reset player with ball for new frame
+        self.player_has_ball = None
+
         # Get ball and player data for this frame
         ball_dict = tracks.get("ball", {})
         player_dict = tracks.get("players", {})
@@ -71,11 +80,15 @@ class PlayerBallAssigner():
         if not ball_dict or 1 not in ball_dict:
             if len(self.ball_possession) > 0:
                 self.ball_possession.append(self.ball_possession[-1])
+            else:
+                self.ball_possession.append(0)
             return
         
         ball_bbox = ball_dict[1]["bbox"]
         assigned_player = self.assign_ball_to_player(player_dict, ball_bbox)
         
+        self.player_has_ball = assigned_player if assigned_player != -1 else None
+
         if assigned_player != -1 and assigned_player in player_dict:
             # Mark player as having the ball
             tracks["players"][assigned_player]["has_ball"] = True
@@ -86,6 +99,10 @@ class PlayerBallAssigner():
                 self.ball_possession.append(team)
             elif len(self.ball_possession) > 0:
                 self.ball_possession.append(self.ball_possession[-1])
+            else:
+                self.ball_possession.append(0)
         elif len(self.ball_possession) > 0:
             # No player assigned, keep previous possession
             self.ball_possession.append(self.ball_possession[-1])
+        else:
+            self.ball_possession.append(0)
