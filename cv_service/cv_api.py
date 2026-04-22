@@ -84,7 +84,72 @@ class SessionInfo(BaseModel):
 active_sessions: Dict[str, Dict] = {}
 _lock = threading.Lock()
 
-MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "best.pt")
+DEFAULT_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "best.pt")
+
+def _download_file(url: str, dest_path: str, timeout_sec: float = 30.0) -> None:
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    with requests.get(url, stream=True, timeout=timeout_sec) as r:
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+def _resolve_model_path() -> str:
+    """
+    Resolve YOLO weights path for runtime environments like Render.
+
+    - If CV_MODEL_PATH points to an existing file, use it.
+    - Else if CV_MODEL_URL is set, download weights to /tmp and use them.
+    - Else if repo default exists, use it (local dev).
+    - Else fall back to a built-in Ultralytics model name so service still runs.
+    """
+    env_path = os.getenv("CV_MODEL_PATH")
+    if env_path and os.path.exists(env_path):
+        print(f"[CV] Using CV_MODEL_PATH={env_path}")
+        return env_path
+
+    if os.path.exists(DEFAULT_MODEL_PATH):
+        return DEFAULT_MODEL_PATH
+
+    url = os.getenv("CV_MODEL_URL")
+    if url:
+        dest = os.getenv("CV_MODEL_DOWNLOAD_PATH") or "/tmp/matchvision/models/best.pt"
+        if not os.path.exists(dest):
+            print(f"[CV] Downloading model weights from CV_MODEL_URL to {dest}")
+            _download_file(url, dest, timeout_sec=float(os.getenv("CV_MODEL_DOWNLOAD_TIMEOUT_SEC", "60")))
+        else:
+            print(f"[CV] Using cached downloaded model at {dest}")
+        return dest
+
+    fallback = os.getenv("CV_MODEL_FALLBACK", "yolov8n.pt")
+    print(
+        f"[CV] WARNING: Model weights not found at {DEFAULT_MODEL_PATH} and CV_MODEL_URL not set. "
+        f"Falling back to {fallback} (accuracy may be reduced)."
+    )
+    return fallback
+
+def _read_exact_with_timeout(stream, nbytes: int, timeout_sec: float) -> bytes:
+    """
+    Read exactly nbytes from a stream within timeout_sec.
+    Returns bytes read (may be shorter if timed out).
+
+    Prevents deadlock when ffmpeg stdout produces no frames.
+    """
+    import select
+    buf = bytearray()
+    deadline = time.time() + float(timeout_sec)
+    while len(buf) < nbytes and time.time() < deadline:
+        remaining = nbytes - len(buf)
+        # Wait until fd is readable
+        rlist, _, _ = select.select([stream], [], [], max(0.0, deadline - time.time()))
+        if not rlist:
+            break
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
 
 
 # ─────────────────────────────────────────────
@@ -267,13 +332,33 @@ def _run_cv_pipeline_inner(
 
     # ── Read first frame ──
     if is_ffmpeg_pipe and proc:
-        raw = proc.stdout.read(frame_size)
+        raw = _read_exact_with_timeout(proc.stdout, frame_size, timeout_sec=float(os.getenv("CV_FFMPEG_FIRST_FRAME_TIMEOUT_SEC", "12")))
         if len(raw) < frame_size:
             print(f"[CV] ERROR: Cannot read first frame from FFmpeg pipe")
             proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+            print(f"[CV] Falling back to cv2.VideoCapture for stream={stream_id}")
+            cap, meta = _open_hls_via_cv2(hls_url)
+            if cap is None or not cap.isOpened():
+                _cleanup_session(stream_id)
+                return
+            ret, frame = cap.read()
+            if not ret:
+                print(f"[CV] ERROR: Cannot read first frame via cv2 fallback for {stream_id}")
+                cap.release()
+                _cleanup_session(stream_id)
+                return
+            fh, fw = frame.shape[:2]
+            is_ffmpeg_pipe = False
+            proc = None
+            meta = meta or {}
+            fps = meta.get("fps", fps)
             _cleanup_session(stream_id)
-            return
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape(fh, fw, 3)
+        else:
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(fh, fw, 3)
     else:
         ret, frame = cap.read()
         if not ret:
@@ -286,7 +371,8 @@ def _run_cv_pipeline_inner(
     print(f"[CV] First frame read successfully: {fw}x{fh}")
 
     # Init CV modules (same as realtime_main.py)
-    tracker = Tracker(MODEL_PATH, [0, 1, 2, 3], verbose=False)
+    model_path = _resolve_model_path()
+    tracker = Tracker(model_path, [0, 1, 2, 3], verbose=False)
     cam_est = CameraMovementEstimator(frame, [0, 1, 2, 3], verbose=False)
     t_assign = TeamAssigner()
     b_assign = PlayerBallAssigner()
@@ -722,10 +808,18 @@ def _run_vod_analysis(
     # Read first frame
     if is_ffmpeg_pipe:
         proc: subprocess.Popen = cap._ffmpeg_proc  # type: ignore
-        raw = proc.stdout.read(meta["width"] * meta["height"] * 3)
+        raw = _read_exact_with_timeout(
+            proc.stdout,
+            meta["width"] * meta["height"] * 3,
+            timeout_sec=float(os.getenv("CV_FFMPEG_FIRST_FRAME_TIMEOUT_SEC", "12")),
+        )
         if len(raw) < meta["width"] * meta["height"] * 3:
             print(f"[CV-VOD] ERROR: Cannot read first frame from FFmpeg pipe")
             proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
             _post_vod_result(callback_url, vod_id, None, error="Cannot read video frames")
             _cleanup_session(session_key)
             return
@@ -746,7 +840,8 @@ def _run_vod_analysis(
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
 
     # Init CV modules
-    tracker = Tracker(MODEL_PATH, [0, 1, 2, 3], verbose=False)
+    model_path = _resolve_model_path()
+    tracker = Tracker(model_path, [0, 1, 2, 3], verbose=False)
     cam_est = CameraMovementEstimator(frame, [0, 1, 2, 3], verbose=False)
     t_assign = TeamAssigner()
     b_assign = PlayerBallAssigner()
