@@ -84,7 +84,50 @@ class SessionInfo(BaseModel):
 active_sessions: Dict[str, Dict] = {}
 _lock = threading.Lock()
 
-MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "best.pt")
+DEFAULT_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "best.pt")
+
+def _download_file(url: str, dest_path: str, timeout_sec: float = 30.0) -> None:
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    with requests.get(url, stream=True, timeout=timeout_sec) as r:
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+def _resolve_model_path() -> str:
+    """
+    Resolve YOLO weights path for runtime environments like Render.
+
+    - If CV_MODEL_PATH points to an existing file, use it.
+    - Else if CV_MODEL_URL is set, download weights to /tmp and use them.
+    - Else if repo default exists, use it (local dev).
+    - Else fall back to a built-in Ultralytics model name so service still runs.
+    """
+    env_path = os.getenv("CV_MODEL_PATH")
+    if env_path and os.path.exists(env_path):
+        print(f"[CV] Using CV_MODEL_PATH={env_path}")
+        return env_path
+
+    if os.path.exists(DEFAULT_MODEL_PATH):
+        return DEFAULT_MODEL_PATH
+
+    url = os.getenv("CV_MODEL_URL")
+    if url:
+        dest = os.getenv("CV_MODEL_DOWNLOAD_PATH") or "/tmp/matchvision/models/best.pt"
+        if not os.path.exists(dest):
+            print(f"[CV] Downloading model weights from CV_MODEL_URL to {dest}")
+            _download_file(url, dest, timeout_sec=float(os.getenv("CV_MODEL_DOWNLOAD_TIMEOUT_SEC", "60")))
+        else:
+            print(f"[CV] Using cached downloaded model at {dest}")
+        return dest
+
+    fallback = os.getenv("CV_MODEL_FALLBACK", "yolov8n.pt")
+    print(
+        f"[CV] WARNING: Model weights not found at {DEFAULT_MODEL_PATH} and CV_MODEL_URL not set. "
+        f"Falling back to {fallback} (accuracy may be reduced)."
+    )
+    return fallback
 
 def _read_exact_with_timeout(stream, nbytes: int, timeout_sec: float) -> bytes:
     """
@@ -328,7 +371,8 @@ def _run_cv_pipeline_inner(
     print(f"[CV] First frame read successfully: {fw}x{fh}")
 
     # Init CV modules (same as realtime_main.py)
-    tracker = Tracker(MODEL_PATH, [0, 1, 2, 3], verbose=False)
+    model_path = _resolve_model_path()
+    tracker = Tracker(model_path, [0, 1, 2, 3], verbose=False)
     cam_est = CameraMovementEstimator(frame, [0, 1, 2, 3], verbose=False)
     t_assign = TeamAssigner()
     b_assign = PlayerBallAssigner()
@@ -796,7 +840,8 @@ def _run_vod_analysis(
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
 
     # Init CV modules
-    tracker = Tracker(MODEL_PATH, [0, 1, 2, 3], verbose=False)
+    model_path = _resolve_model_path()
+    tracker = Tracker(model_path, [0, 1, 2, 3], verbose=False)
     cam_est = CameraMovementEstimator(frame, [0, 1, 2, 3], verbose=False)
     t_assign = TeamAssigner()
     b_assign = PlayerBallAssigner()
