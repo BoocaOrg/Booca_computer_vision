@@ -24,4 +24,5 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "cv_service.cv_api:app", "--host", "0.0.0.0", "--port", "8000"]
+# Render injects $PORT at runtime; use it (fallback 8000 for local).
+CMD ["sh", "-c", "uvicorn cv_service.cv_api:app --host 0.0.0.0 --port ${PORT:-8000}"]
