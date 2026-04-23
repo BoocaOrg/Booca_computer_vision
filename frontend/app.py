@@ -558,6 +558,16 @@ elif model_choice == "models/best.onnx (ONNX)":
     model_path = "models/best.onnx"
 else:
     model_path = "models/best.pt"
+
+# Validate model path — fallback to stock Ultralytics model if custom weights missing
+if not os.path.exists(model_path):
+    _fallback_model = os.getenv("CV_MODEL_FALLBACK", "yolov8n.pt")
+    st.sidebar.warning(
+        f"⚠️ Model not found: `{model_path}`. "
+        f"Falling back to `{_fallback_model}` (accuracy may be reduced)."
+    )
+    model_path = _fallback_model
+
 st.sidebar.caption(f"Active model: {model_path}")
 use_cache = st.sidebar.checkbox(
     "Use Cached Tracks",

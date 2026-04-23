@@ -61,6 +61,34 @@ class Tracker:
         self.imgsz = imgsz
         self.interpolation_tracker = None   # used for ball annotation: don't draw ball in a large interpolation window
 
+        # Detect if this is a COCO model (yolov8n.pt etc.) vs custom-trained model
+        # COCO models use "person"/"sports ball"; custom model uses "player"/"goalkeeper"/"ball"/"referee"
+        model_names = self.model.names if hasattr(self.model, 'names') else {}
+        model_class_values = set(model_names.values()) if model_names else set()
+        self._is_coco_model = "person" in model_class_values and "player" not in model_class_values
+        if self._is_coco_model and verbose:
+            print("[Tracker] COCO model detected — mapping person→player, sports ball→ball")
+
+    def _resolve_class_names(self, cls_names_switched: dict) -> dict:
+        """
+        Resolve class name → class ID mapping, handling both custom and COCO models.
+        For COCO models, maps: person→player, sports ball→ball.
+        Returns dict with keys: 'player', 'goalkeeper', 'ball', 'referee' (some may be missing).
+        """
+        if not self._is_coco_model:
+            return cls_names_switched
+
+        resolved = {}
+        # person → player (and goalkeeper)
+        if "person" in cls_names_switched:
+            resolved["player"] = cls_names_switched["person"]
+            resolved["goalkeeper"] = cls_names_switched["person"]  # same class for COCO
+        # sports ball → ball
+        if "sports ball" in cls_names_switched:
+            resolved["ball"] = cls_names_switched["sports ball"]
+        # COCO has no "referee" class — leave it out so lookups return None gracefully
+        return resolved
+
     def interpolate_ball_positions(self, ball_tracks: List[Dict]) -> List[Dict]:
         """
         If the ball is not detected in every frame, take the frames where it is detected and interpolate
@@ -125,40 +153,38 @@ class Tracker:
         for frame_num, detection in enumerate(detections):
             cls_names = detection.names
             cls_names_switched = {v: k for k, v in cls_names.items()}       # swap keys and values, e.g. ball: 1 --> 1: ball for easier access
+            resolved = self._resolve_class_names(cls_names_switched)
 
             # convert to supervision detection format
             detection_supervision = sv.Detections.from_ultralytics(detection)      # xyxy bboxes
             
             # convert goalkeeper to player
             # goalkeepers might get predicted as players in some frames and that could cause tracking issues
+            player_cls_id = resolved.get("player")
+            goalkeeper_cls_id = resolved.get("goalkeeper")
             for index, class_id in enumerate(detection_supervision.class_id):
-                if cls_names[class_id] == "goalkeeper":
-                    detection_supervision.class_id[index] = cls_names_switched["player"]
-            # before:
-            # class_id=array([1, 2, 2, 2, 2, 3, 3]), tracker_id=None, data={'class_name': array(['goalkeeper', 'player', 'player', 'player', 'player', 'referee', 'referee'], dtype='<U7')}
-            # after:          ^
-            # class_id=array([2, 2, 2, 2, 2, 3, 3]), tracker_id=None, data={'class_name': array(['goalkeeper', 'player', 'player', 'player', 'player', 'referee', 'referee'], dtype='<U7')}
+                if cls_names[class_id] == "goalkeeper" and player_cls_id is not None:
+                    detection_supervision.class_id[index] = player_cls_id
             
             # track objects
-            detections_with_tracks = self.tracker.update_with_detections(detection_supervision)    # adds tracker object to detections, every object gets a unique tracker id
-            # example:
-            # class_id=array([2, 2, 2, 2, 2, 3, 3]), tracker_id=array([ 1,  2,  3,  4,  5,  6,  7]), data={'class_name': array(['player', 'player', 'player', 'player', 'player', 'referee', 'referee'], dtype='<U7')}
+            detections_with_tracks = self.tracker.update_with_detections(detection_supervision)
 
             tracks["players"].append({}) 
             tracks["referees"].append({})
             tracks["ball"].append({})
 
+            referee_cls_id = resolved.get("referee")
+            ball_cls_id = resolved.get("ball")
+
             for frame_detection in detections_with_tracks:
-                # frame_detection: Detections (bboxes), mask, confidence, class_id, tracker_id, class_name
                 bbox = frame_detection[0].tolist()
                 class_id = frame_detection[3]
                 tracker_id = frame_detection[4]
 
-                # add object at class (players/referees/ball) at index (frame) with its unique tracker ID
-                if class_id == cls_names_switched["player"]:
+                if player_cls_id is not None and class_id == player_cls_id:
                     tracks["players"][frame_num][tracker_id] = {"bbox": bbox}
 
-                if class_id == cls_names_switched["referee"]:
+                if referee_cls_id is not None and class_id == referee_cls_id:
                     tracks["referees"][frame_num][tracker_id] = {"bbox": bbox}
 
             # no tracker for the ball as there is only one
@@ -166,7 +192,7 @@ class Tracker:
                 bbox = frame_detection[0].tolist()
                 class_id = frame_detection[3]
 
-                if class_id == cls_names_switched["ball"] and frame_detection[2] >= 0.3:    # higher confidence for ball to avoid tracking of field parts etc.
+                if ball_cls_id is not None and class_id == ball_cls_id and frame_detection[2] >= 0.3:
                     tracks["ball"][frame_num][1] = {"bbox": bbox}   # ID 1 as there is only one ball
 
         if self.verbose:
@@ -246,14 +272,16 @@ class Tracker:
         
         cls_names = detection.names
         cls_names_switched = {v: k for k, v in cls_names.items()}
+        resolved = self._resolve_class_names(cls_names_switched)
         
         # Convert to supervision format
         detection_supervision = sv.Detections.from_ultralytics(detection)
         
         # Convert goalkeeper to player
+        player_cls_id = resolved.get("player")
         for index, class_id in enumerate(detection_supervision.class_id):
-            if cls_names[class_id] == "goalkeeper":
-                detection_supervision.class_id[index] = cls_names_switched["player"]
+            if cls_names[class_id] == "goalkeeper" and player_cls_id is not None:
+                detection_supervision.class_id[index] = player_cls_id
         
         # Track objects
         detections_with_tracks = self.tracker.update_with_detections(detection_supervision)
@@ -265,14 +293,17 @@ class Tracker:
             "ball": {}
         }
         
+        referee_cls_id = resolved.get("referee")
+        ball_cls_id = resolved.get("ball")
+        
         for frame_detection in detections_with_tracks:
             bbox = frame_detection[0].tolist()
             cls_id = frame_detection[3]
             track_id = frame_detection[4]
             
-            if cls_id == cls_names_switched["player"]:
+            if player_cls_id is not None and cls_id == player_cls_id:
                 tracks["players"][track_id] = {"bbox": bbox}
-            elif cls_id == cls_names_switched["referee"]:
+            elif referee_cls_id is not None and cls_id == referee_cls_id:
                 tracks["referees"][track_id] = {"bbox": bbox}
         
         # Ball tracking (no tracking ID, just detection)
@@ -281,7 +312,7 @@ class Tracker:
             cls_id = frame_detection[3]
             conf = frame_detection[2]
 
-            if cls_id == cls_names_switched["ball"] and conf >= 0.3:
+            if ball_cls_id is not None and cls_id == ball_cls_id and conf >= 0.3:
                 tracks["ball"][1] = {"bbox": bbox}
                 break  # Only one ball
         

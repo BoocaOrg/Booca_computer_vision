@@ -165,8 +165,8 @@ cython_debug/
 # Project-specific ignores
 # ==========================================
 
-# Model weights (download separately)
-models/*.pt
+# Model weights — commit .pt files, ignore machine-specific TensorRT engines
+models/*.engine
 
 # Demo & output videos
 demos/
