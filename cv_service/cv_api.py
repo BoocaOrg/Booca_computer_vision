@@ -399,6 +399,10 @@ def _run_cv_pipeline_inner(
     BACKOFF_BASE_SEC = float(os.getenv("CV_HLS_RECONNECT_BASE_SLEEP", "2.0"))
     BACKOFF_MAX_SEC = float(os.getenv("CV_HLS_RECONNECT_MAX_SLEEP", "30.0"))
 
+    # ── Accumulators for final match summary ──
+    all_events: list = []
+    all_player_counts: list = []
+
     print(f"[CV] Pipeline running for stream={stream_id} ({fw}x{fh}, {fps:.1f}fps, ffmpeg={is_ffmpeg_pipe})")
 
     while not stop_event.is_set():
@@ -491,6 +495,11 @@ def _run_cv_pipeline_inner(
                     tracks["players"][pid]["team"] = team
                     tracks["players"][pid]["team_colour"] = t_assign.team_colours[team]
 
+                # ── Accumulate player counts for final summary ──
+                t1_count = sum(1 for p in players.values() if p.get("team") == 1)
+                t2_count = sum(1 for p in players.values() if p.get("team") == 2)
+                all_player_counts.append({"team1": t1_count, "team2": t2_count})
+
             # ── Ball Possession ──
             b_assign.assign_ball_single_frame(tracks)
 
@@ -507,6 +516,18 @@ def _run_cv_pipeline_inner(
 
             # OCR Jersey Numbers (runs only on large bboxes)
             jersey_map = ocr_reader.process_frame(frame, tracks, frame_count)
+
+            # ── Accumulate events for final summary ──
+            if ev_detect is not None:
+                event = ev_detect.check_events(tracks, frame_count)
+                if event:
+                    event["frame"] = frame_count
+                    event["timestamp"] = round(frame_count / fps, 1)
+                    all_events.append(event)
+            if pass_event:
+                pass_event["frame"] = frame_count
+                pass_event["timestamp"] = round(frame_count / fps, 1)
+                all_events.append(pass_event)
 
             if now - last_post_time >= POST_INTERVAL:
                 last_post_time = now
@@ -539,6 +560,21 @@ def _run_cv_pipeline_inner(
         cap.release()
     except Exception:
         pass
+
+    # ── POST final match summary to BOOCA backend ──
+    if frame_count > 0:
+        try:
+            final_result = _aggregate_vod_stats(b_assign, all_player_counts, all_events, frame_count, speed_est, tact_analyzer)
+            final_result["matchDuration"] = round(frame_count / fps, 1)
+
+            # Build the live-result callback URL from the stats callback URL
+            live_result_url = callback_url.replace("/stats-callback", "/live-result")
+            print(f"[CV] Posting final match summary for stream={stream_id} to {live_result_url}")
+
+            _post_vod_result(live_result_url, stream_id, final_result)
+        except Exception as e:
+            print(f"[CV] Failed to post final match summary for stream={stream_id}: {e}")
+
     _cleanup_session(stream_id)
     print(f"[CV] Pipeline stopped for stream={stream_id} (processed {frame_count} frames)")
 
