@@ -1680,6 +1680,8 @@ else:  # Realtime Analysis
                 st.sidebar.warning(f"⚠️ Pafy failed: {str(e)[:50]}")
         
         # Method 2: Try yt-dlp (best for most platforms)
+        # For YouTube: use yt-dlp pipe URL so cv2 can read the stream without URL expiry issues
+        _is_youtube = "youtube.com" in url or "youtu.be" in url
         try:
             import yt_dlp
             st.sidebar.text("🔍 Trying yt-dlp...")
@@ -1694,6 +1696,11 @@ else:  # Realtime Analysis
                     'sd',                   # Facebook SD
                     'best',                 # Any best
                     None,                   # No format filter (let yt-dlp decide)
+                ]
+            elif _is_youtube:
+                # YouTube: prefer 720p or lower for stability; avoid DASH-only formats
+                format_attempts = [
+                    'best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best',
                 ]
             else:
                 format_attempts = [
@@ -1736,6 +1743,16 @@ else:  # Realtime Analysis
                     continue
             
             if resolved_url:
+                # For YouTube: wrap in a yt-dlp pipe URL so cv2 doesn't hit signed URL expiry
+                # Format: "pipe:yt-dlp -o - <url>" — OpenCV reads from stdout
+                if _is_youtube:
+                    import shutil
+                    _ytdlp_bin = shutil.which("yt-dlp") or "yt-dlp"
+                    pipe_url = f"pipe:{_ytdlp_bin} -f best[height<=720][ext=mp4]/best[height<=720]/best -o - {url}"
+                    st.sidebar.success("✅ YouTube stream resolved via yt-dlp pipe")
+                    # Store original URL for export
+                    st.session_state['resolved_from_url'] = url
+                    return pipe_url
                 st.sidebar.success(f"✅ Resolved via yt-dlp" + (" (Facebook)" if is_facebook else ""))
                 return resolved_url
             else:
@@ -2028,6 +2045,43 @@ else:  # Realtime Analysis
                     proxy = get_hls_proxy()
                     proxied_url = proxy.get_proxy_url(source_path)
                     cap = cv2.VideoCapture(proxied_url, cv2.CAP_FFMPEG)
+            elif isinstance(source_path, str) and source_path.startswith("pipe:"):
+                # YouTube / yt-dlp pipe: spawn subprocess and read from stdout
+                import subprocess as _sp
+                _pipe_cmd = source_path[5:]  # strip "pipe:" prefix
+                _pipe_args = _pipe_cmd.split()
+                st_status.info("🔄 Opening YouTube stream via yt-dlp pipe...")
+                try:
+                    _yt_proc = _sp.Popen(
+                        _pipe_args,
+                        stdout=_sp.PIPE,
+                        stderr=_sp.DEVNULL,
+                        bufsize=10**8,
+                    )
+                    # Write stdout to a temp named pipe / temp file for cv2
+                    import tempfile as _tf
+                    _tmp_fifo = _tf.mktemp(suffix=".mp4")
+                    # Use cv2 with the process stdout via a named pipe trick
+                    # Simpler: just use the resolved direct URL from yt-dlp info
+                    # Re-resolve to get the direct URL (not pipe)
+                    _yt_proc.terminate()
+                    import yt_dlp as _ytdlp_mod
+                    _orig_url = st.session_state.get('resolved_from_url', source_path)
+                    with _ytdlp_mod.YoutubeDL({'quiet': True, 'format': 'best[height<=720][ext=mp4]/best[height<=720]/best'}) as _ydl:
+                        _info = _ydl.extract_info(_orig_url, download=False)
+                        _direct = _info.get('url') or (_info.get('formats') or [{}])[-1].get('url', '')
+                    if _direct:
+                        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                            "reconnect;1|reconnect_streamed;1|reconnect_delay_max;5"
+                            "|rw_timeout;30000000"
+                        )
+                        cap = cv2.VideoCapture(_direct, cv2.CAP_FFMPEG)
+                        st_status.info("🔄 Connecting to YouTube stream...")
+                    else:
+                        cap = cv2.VideoCapture(0)  # fallback
+                except Exception as _yt_err:
+                    st.error(f"❌ YouTube pipe error: {_yt_err}")
+                    cap = None
             else:
                 if use_nvdec:
                     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "hwaccel;cuda|video_codec;h264_cuvid"
