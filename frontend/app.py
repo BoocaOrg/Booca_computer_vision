@@ -1308,6 +1308,151 @@ if analysis_mode == "Offline Processing":
                                 </div>
                                 """, unsafe_allow_html=True)
                     
+                    # ============================================================
+                    # 📤 EXPORT MATCH DATA
+                    # ============================================================
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    st.markdown(f"""
+                    <div style="background:{_card_bg}; border:1px solid {_card_border}; border-radius:12px; padding:24px;">
+                        <h4 style="color:{_text_primary}; margin:0 0 4px 0; font-size:16px;">📤 Export Match Data</h4>
+                        <p style="color:{_text_secondary}; font-size:13px; margin:0;">Download or save match analysis to Booca database for tournament features.</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.markdown("<br>", unsafe_allow_html=True)
+
+                    import json as _json
+                    import io as _io
+
+                    # Build the unified match data payload
+                    _match_payload = {
+                        "source": video_name or "unknown",
+                        "analyzedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "duration_sec": round(match_duration_sec, 1),
+                        "fps": round(fps, 2),
+                        "total_frames": total_frames_count,
+                        "possession": {
+                            "team1_pct": t1_poss_pct,
+                            "team2_pct": t2_poss_pct,
+                        },
+                        "passes": {
+                            "team1": t1_passes,
+                            "team2": t2_passes,
+                            "total": t1_passes + t2_passes,
+                        },
+                        "goals": {
+                            "team1": t1_goals,
+                            "team2": t2_goals,
+                        },
+                        "formations": tactical_result.get("formations", {}),
+                        "space_control": tactical_result.get("space_control", {}),
+                        "player_stats": {
+                            str(pid): {
+                                "team": s.get("team"),
+                                "total_distance_m": s.get("total_distance_m", 0),
+                                "sprint_count": s.get("sprint_count", 0),
+                                "top_speed_kmh": round(s.get("current_speed", 0), 1),
+                            }
+                            for pid, s in all_player_stats.items()
+                        },
+                        "events": [
+                            {
+                                "event": e.get("event"),
+                                "frame": e.get("frame", 0),
+                                "time_sec": round(e.get("frame", 0) / fps, 1) if fps > 0 else 0,
+                                "scoring_team": e.get("scoring_team", e.get("scoringTeam")),
+                                "from_player": e.get("from_player"),
+                                "to_player": e.get("to_player"),
+                                "side": e.get("side"),
+                            }
+                            for e in all_events
+                        ],
+                        "heatmaps": {
+                            "team1": tactical_result.get("heatmaps", {}).get("team1", []),
+                            "team2": tactical_result.get("heatmaps", {}).get("team2", []),
+                        },
+                    }
+
+                    # Convert heatmap numpy arrays to lists for JSON serialization
+                    for _tk in ["team1", "team2"]:
+                        _hm = _match_payload["heatmaps"][_tk]
+                        if hasattr(_hm, "tolist"):
+                            _match_payload["heatmaps"][_tk] = _hm.tolist()
+
+                    _exp_col1, _exp_col2, _exp_col3 = st.columns(3)
+
+                    # --- Download JSON ---
+                    with _exp_col1:
+                        _json_bytes = _json.dumps(_match_payload, indent=2, ensure_ascii=False).encode("utf-8")
+                        st.download_button(
+                            label="⬇️ Download JSON",
+                            data=_json_bytes,
+                            file_name=f"match_data_{time.strftime('%Y%m%d_%H%M%S')}.json",
+                            mime="application/json",
+                            use_container_width=True,
+                        )
+
+                    # --- Download CSV (player stats) ---
+                    with _exp_col2:
+                        import pandas as _pd_exp
+                        _csv_rows = []
+                        for _pid, _s in all_player_stats.items():
+                            _csv_rows.append({
+                                "player_id": int(_pid),
+                                "team": _s.get("team", ""),
+                                "distance_m": _s.get("total_distance_m", 0),
+                                "sprint_count": _s.get("sprint_count", 0),
+                                "top_speed_kmh": round(_s.get("current_speed", 0), 1),
+                            })
+                        _csv_df = _pd_exp.DataFrame(_csv_rows)
+                        _csv_buf = _io.StringIO()
+                        _csv_df.to_csv(_csv_buf, index=False)
+                        st.download_button(
+                            label="⬇️ Download CSV",
+                            data=_csv_buf.getvalue().encode("utf-8"),
+                            file_name=f"player_stats_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+
+                    # --- Save to Booca DB ---
+                    with _exp_col3:
+                        _stream_id_for_export = (
+                            st.session_state.get("booca_stream_info", {}).get("id")
+                            or st.session_state.get("booca_vod_stream_id")
+                        )
+                        _save_label = "💾 Save to Booca DB"
+                        if st.button(_save_label, use_container_width=True, key="export_to_booca_db"):
+                            _api_base = os.getenv("BOOCA_API_URL", "http://localhost:5000/api")
+                            _export_url = f"{_api_base}/cv-analysis/match-data"
+                            _headers = {"Content-Type": "application/json"}
+                            _token = os.getenv("BOOCA_CV_TOKEN", "")
+                            if _token:
+                                _headers["Authorization"] = f"Bearer {_token}"
+                            _body = {**_match_payload}
+                            if _stream_id_for_export:
+                                _body["streamId"] = _stream_id_for_export
+                            try:
+                                import requests as _req_exp
+                                _resp = _req_exp.post(
+                                    _export_url,
+                                    json=_body,
+                                    headers=_headers,
+                                    timeout=15,
+                                )
+                                if _resp.status_code in (200, 201):
+                                    st.success("✅ Saved to Booca DB!")
+                                else:
+                                    _err = _resp.json() if _resp.content else {}
+                                    st.error(f"❌ API error {_resp.status_code}: {_err.get('message', _resp.text[:80])}")
+                            except Exception as _ex:
+                                st.error(f"❌ Could not reach Booca API: {_ex}")
+
+                    # Optional: show stream ID being used
+                    if _stream_id_for_export:
+                        st.caption(f"🔗 Stream ID: `{_stream_id_for_export}`")
+                    else:
+                        st.caption("ℹ️ No stream ID detected — JSON/CSV export still available. To save to DB, process a Booca VOD.")
+
                 except Exception as e:
                     st.error(f"❌ Error during processing: {str(e)}")
                     import traceback
