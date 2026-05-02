@@ -69,6 +69,8 @@ class StartRequest(BaseModel):
     # Optional: protect /cv/start in production without changing callers that don't pass it.
     # When CV_START_TOKEN is set, requests MUST include this token.
     token: Optional[str] = None
+    # Optional: tournament match ID — used to tag events with the correct match context
+    match_id: Optional[str] = None
 
 
 class SessionInfo(BaseModel):
@@ -191,6 +193,7 @@ async def start_analysis(req: StartRequest, background_tasks: BackgroundTasks):
             "stop_event": stop_event,
             "frame_count": 0,
             "started_at": time.time(),
+            "match_id": req.match_id,
         }
 
     background_tasks.add_task(
@@ -200,6 +203,7 @@ async def start_analysis(req: StartRequest, background_tasks: BackgroundTasks):
         req.booca_callback_url,
         req.features,
         stop_event,
+        req.match_id,
     )
     return {"status": "started", "stream_id": req.stream_id}
 
@@ -269,10 +273,11 @@ def _run_cv_pipeline(
     callback_url: str,
     features: List[str],
     stop_event: threading.Event,
+    match_id: Optional[str] = None,
 ):
     """Main CV loop — reads HLS, detects, tracks, collects stats, POSTs back."""
     try:
-        _run_cv_pipeline_inner(stream_id, hls_url, callback_url, features, stop_event)
+        _run_cv_pipeline_inner(stream_id, hls_url, callback_url, features, stop_event, match_id)
     except Exception as e:
         import traceback
         print(f"[CV] FATAL ERROR in pipeline for stream={stream_id}: {e}")
@@ -286,6 +291,7 @@ def _run_cv_pipeline_inner(
     callback_url: str,
     features: List[str],
     stop_event: threading.Event,
+    match_id: Optional[str] = None,
 ):
     """Inner pipeline logic — wrapped by _run_cv_pipeline for error handling."""
     parsed = urlparse(hls_url)
@@ -295,6 +301,8 @@ def _run_cv_pipeline_inner(
     if hls_host:
         print(f"[CV]   HLS host: {hls_host}")
     print(f"[CV]   Callback: {callback_url}")
+    if match_id:
+        print(f"[CV]   Match ID: {match_id}")
 
     is_hls = hls_url.endswith(".m3u8") or ".m3u8?" in hls_url
 
@@ -399,6 +407,10 @@ def _run_cv_pipeline_inner(
     BACKOFF_BASE_SEC = float(os.getenv("CV_HLS_RECONNECT_BASE_SLEEP", "2.0"))
     BACKOFF_MAX_SEC = float(os.getenv("CV_HLS_RECONNECT_MAX_SLEEP", "30.0"))
 
+    # ── Accumulators for final match summary ──
+    all_events: list = []
+    all_player_counts: list = []
+
     print(f"[CV] Pipeline running for stream={stream_id} ({fw}x{fh}, {fps:.1f}fps, ffmpeg={is_ffmpeg_pipe})")
 
     while not stop_event.is_set():
@@ -491,6 +503,11 @@ def _run_cv_pipeline_inner(
                     tracks["players"][pid]["team"] = team
                     tracks["players"][pid]["team_colour"] = t_assign.team_colours[team]
 
+                # ── Accumulate player counts for final summary ──
+                t1_count = sum(1 for p in players.values() if p.get("team") == 1)
+                t2_count = sum(1 for p in players.values() if p.get("team") == 2)
+                all_player_counts.append({"team1": t1_count, "team2": t2_count})
+
             # ── Ball Possession ──
             b_assign.assign_ball_single_frame(tracks)
 
@@ -507,6 +524,18 @@ def _run_cv_pipeline_inner(
 
             # OCR Jersey Numbers (runs only on large bboxes)
             jersey_map = ocr_reader.process_frame(frame, tracks, frame_count)
+
+            # ── Accumulate events for final summary ──
+            if ev_detect is not None:
+                event = ev_detect.check_events(tracks, frame_count)
+                if event:
+                    event["frame"] = frame_count
+                    event["timestamp"] = round(frame_count / fps, 1)
+                    all_events.append(event)
+            if pass_event:
+                pass_event["frame"] = frame_count
+                pass_event["timestamp"] = round(frame_count / fps, 1)
+                all_events.append(pass_event)
 
             if now - last_post_time >= POST_INTERVAL:
                 last_post_time = now
@@ -539,6 +568,21 @@ def _run_cv_pipeline_inner(
         cap.release()
     except Exception:
         pass
+
+    # ── POST final match summary to BOOCA backend ──
+    if frame_count > 0:
+        try:
+            final_result = _aggregate_vod_stats(b_assign, all_player_counts, all_events, frame_count, speed_est, tact_analyzer)
+            final_result["matchDuration"] = round(frame_count / fps, 1)
+
+            # Build the live-result callback URL from the stats callback URL
+            live_result_url = callback_url.replace("/stats-callback", "/live-result")
+            print(f"[CV] Posting final match summary for stream={stream_id} to {live_result_url}")
+
+            _post_vod_result(live_result_url, stream_id, final_result)
+        except Exception as e:
+            print(f"[CV] Failed to post final match summary for stream={stream_id}: {e}")
+
     _cleanup_session(stream_id)
     print(f"[CV] Pipeline stopped for stream={stream_id} (processed {frame_count} frames)")
 
