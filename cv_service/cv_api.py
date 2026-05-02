@@ -69,6 +69,8 @@ class StartRequest(BaseModel):
     # Optional: protect /cv/start in production without changing callers that don't pass it.
     # When CV_START_TOKEN is set, requests MUST include this token.
     token: Optional[str] = None
+    # Optional: tournament match ID — used to tag events with the correct match context
+    match_id: Optional[str] = None
 
 
 class SessionInfo(BaseModel):
@@ -191,6 +193,7 @@ async def start_analysis(req: StartRequest, background_tasks: BackgroundTasks):
             "stop_event": stop_event,
             "frame_count": 0,
             "started_at": time.time(),
+            "match_id": req.match_id,
         }
 
     background_tasks.add_task(
@@ -200,6 +203,7 @@ async def start_analysis(req: StartRequest, background_tasks: BackgroundTasks):
         req.booca_callback_url,
         req.features,
         stop_event,
+        req.match_id,
     )
     return {"status": "started", "stream_id": req.stream_id}
 
@@ -269,10 +273,11 @@ def _run_cv_pipeline(
     callback_url: str,
     features: List[str],
     stop_event: threading.Event,
+    match_id: Optional[str] = None,
 ):
     """Main CV loop — reads HLS, detects, tracks, collects stats, POSTs back."""
     try:
-        _run_cv_pipeline_inner(stream_id, hls_url, callback_url, features, stop_event)
+        _run_cv_pipeline_inner(stream_id, hls_url, callback_url, features, stop_event, match_id)
     except Exception as e:
         import traceback
         print(f"[CV] FATAL ERROR in pipeline for stream={stream_id}: {e}")
@@ -286,6 +291,7 @@ def _run_cv_pipeline_inner(
     callback_url: str,
     features: List[str],
     stop_event: threading.Event,
+    match_id: Optional[str] = None,
 ):
     """Inner pipeline logic — wrapped by _run_cv_pipeline for error handling."""
     parsed = urlparse(hls_url)
@@ -295,6 +301,8 @@ def _run_cv_pipeline_inner(
     if hls_host:
         print(f"[CV]   HLS host: {hls_host}")
     print(f"[CV]   Callback: {callback_url}")
+    if match_id:
+        print(f"[CV]   Match ID: {match_id}")
 
     is_hls = hls_url.endswith(".m3u8") or ".m3u8?" in hls_url
 
