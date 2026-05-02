@@ -2406,6 +2406,149 @@ else:  # Realtime Analysis
                     cap.release()
                     st_debug_area.info("⏹️ Stopped")
 
+                    # ============================================================
+                    # 📤 EXPORT MATCH DATA (Realtime — shown after stream stops)
+                    # ============================================================
+                    import json as _json_rt
+                    import io as _io_rt
+
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    st.markdown(f"""
+                    <div style="background:{_card};border:1px solid {_card_border};border-radius:12px;padding:24px;">
+                        <h4 style="color:{_tp};margin:0 0 4px 0;font-size:16px;">📤 Export Match Data</h4>
+                        <p style="color:{_ts};font-size:13px;margin:0;">Download or save match analysis to Booca database for tournament features.</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.markdown("<br>", unsafe_allow_html=True)
+
+                    # Build payload from realtime accumulators
+                    _rt_total_sec = frame_count / rt_fps if rt_fps > 0 else 0
+                    _rt_bp = player_assigner.ball_possession
+                    _rt_bp_arr = np.array([-1 if x is None else x for x in _rt_bp]) if _rt_bp and len(_rt_bp) > 0 else np.array([])
+                    _rt_t1_poss = int(np.sum(_rt_bp_arr == 1)) if len(_rt_bp_arr) > 0 else 0
+                    _rt_t2_poss = int(np.sum(_rt_bp_arr == 2)) if len(_rt_bp_arr) > 0 else 0
+                    _rt_total_poss = _rt_t1_poss + _rt_t2_poss or 1
+                    _rt_t1_pct = round(_rt_t1_poss / _rt_total_poss * 100, 1)
+                    _rt_t2_pct = round(100 - _rt_t1_pct, 1)
+
+                    _rt_player_stats = {}
+                    for _pid in rt_speed_estimator.total_distances:
+                        _rt_player_stats[str(_pid)] = {
+                            "team": None,
+                            "total_distance_m": round(rt_speed_estimator.total_distances[_pid], 1),
+                            "sprint_count": rt_speed_estimator.sprint_counts.get(_pid, 0),
+                            "top_speed_kmh": round(rt_speed_estimator.current_speeds.get(_pid, 0), 1),
+                        }
+
+                    _rt_payload = {
+                        "source": source_path or "realtime",
+                        "analyzedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "duration_sec": round(_rt_total_sec, 1),
+                        "fps": round(rt_fps, 2),
+                        "total_frames": frame_count,
+                        "possession": {
+                            "team1_pct": _rt_t1_pct,
+                            "team2_pct": _rt_t2_pct,
+                        },
+                        "passes": {
+                            "team1": sum(1 for e in rt_events_log if e.get("event") == "pass" and e.get("scoring_team") == 1),
+                            "team2": sum(1 for e in rt_events_log if e.get("event") == "pass" and e.get("scoring_team") == 2),
+                            "total": sum(1 for e in rt_events_log if e.get("event") == "pass"),
+                        },
+                        "goals": {
+                            "team1": sum(1 for e in rt_events_log if e.get("event") == "goal" and e.get("scoring_team") == 1),
+                            "team2": sum(1 for e in rt_events_log if e.get("event") == "goal" and e.get("scoring_team") == 2),
+                        },
+                        "player_stats": _rt_player_stats,
+                        "events": [
+                            {
+                                "event": e.get("event"),
+                                "frame": e.get("frame", 0),
+                                "time_sec": round(e.get("frame", 0) / rt_fps, 1) if rt_fps > 0 else 0,
+                                "scoring_team": e.get("scoring_team", e.get("scoringTeam")),
+                                "from_player": e.get("from_player"),
+                                "to_player": e.get("to_player"),
+                            }
+                            for e in rt_events_log
+                        ],
+                    }
+
+                    _rt_exp_col1, _rt_exp_col2, _rt_exp_col3 = st.columns(3)
+
+                    # --- Download JSON ---
+                    with _rt_exp_col1:
+                        _rt_json_bytes = _json_rt.dumps(_rt_payload, indent=2, ensure_ascii=False).encode("utf-8")
+                        st.download_button(
+                            label="⬇️ Download JSON",
+                            data=_rt_json_bytes,
+                            file_name=f"realtime_match_{time.strftime('%Y%m%d_%H%M%S')}.json",
+                            mime="application/json",
+                            use_container_width=True,
+                            key="rt_dl_json",
+                        )
+
+                    # --- Download CSV (player stats) ---
+                    with _rt_exp_col2:
+                        import pandas as _pd_rt_exp
+                        _rt_csv_rows = [
+                            {
+                                "player_id": int(_pid),
+                                "team": _s.get("team", ""),
+                                "distance_m": _s.get("total_distance_m", 0),
+                                "sprint_count": _s.get("sprint_count", 0),
+                                "top_speed_kmh": _s.get("top_speed_kmh", 0),
+                            }
+                            for _pid, _s in _rt_player_stats.items()
+                        ]
+                        _rt_csv_df = _pd_rt_exp.DataFrame(_rt_csv_rows)
+                        _rt_csv_buf = _io_rt.StringIO()
+                        _rt_csv_df.to_csv(_rt_csv_buf, index=False)
+                        st.download_button(
+                            label="⬇️ Download CSV",
+                            data=_rt_csv_buf.getvalue().encode("utf-8"),
+                            file_name=f"realtime_players_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="rt_dl_csv",
+                        )
+
+                    # --- Save to Booca DB ---
+                    with _rt_exp_col3:
+                        _rt_stream_id = (
+                            st.session_state.get("booca_stream_info", {}).get("id")
+                            or (injected_stream_id if injected_stream_id else None)
+                        )
+                        if st.button("💾 Save to Booca DB", use_container_width=True, key="rt_export_to_booca_db"):
+                            _rt_api_base = os.getenv("BOOCA_API_URL", "http://localhost:5000/api")
+                            _rt_export_url = f"{_rt_api_base}/cv-analysis/match-data"
+                            _rt_headers = {"Content-Type": "application/json"}
+                            _rt_token = os.getenv("BOOCA_CV_TOKEN", "")
+                            if _rt_token:
+                                _rt_headers["Authorization"] = f"Bearer {_rt_token}"
+                            _rt_body = {**_rt_payload}
+                            if _rt_stream_id:
+                                _rt_body["streamId"] = _rt_stream_id
+                            try:
+                                import requests as _req_rt
+                                _rt_resp = _req_rt.post(
+                                    _rt_export_url,
+                                    json=_rt_body,
+                                    headers=_rt_headers,
+                                    timeout=15,
+                                )
+                                if _rt_resp.status_code in (200, 201):
+                                    st.success("✅ Saved to Booca DB!")
+                                else:
+                                    _rt_err = _rt_resp.json() if _rt_resp.content else {}
+                                    st.error(f"❌ API error {_rt_resp.status_code}: {_rt_err.get('message', _rt_resp.text[:80])}")
+                            except Exception as _rt_ex:
+                                st.error(f"❌ Could not reach Booca API: {_rt_ex}")
+
+                    if _rt_stream_id:
+                        st.caption(f"🔗 Stream ID: `{_rt_stream_id}`")
+                    else:
+                        st.caption("ℹ️ No stream ID — JSON/CSV export available. To save to DB, open via Booca dashboard.")
+
         except Exception as e:
             st.error(f"Error: {str(e)}")
             import traceback
