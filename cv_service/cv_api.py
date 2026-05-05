@@ -600,6 +600,23 @@ def _collect_stats(
     fps: float = 30.0,
 ) -> Dict:
     """Collect stats from current CV state."""
+    
+    def convert_numpy_types(obj):
+        """Recursively convert numpy types to Python native types for JSON serialization."""
+        if isinstance(obj, dict):
+            return {k: convert_numpy_types(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_numpy_types(item) for item in obj]
+        elif isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        return obj
+    
     stats: Dict = {}
     # Match elapsed time in seconds (#10 — accurate timing instead of wall clock)
     stats["match_elapsed"] = round(frame_count / fps, 1)
@@ -686,7 +703,8 @@ def _collect_stats(
         # Convert int keys to strings for JSON serialization
         stats["jerseys"] = {str(k): v for k, v in jersey_map.items()}
 
-    return stats
+    # Convert all numpy types to Python native types
+    return convert_numpy_types(stats)
 
 
 def _cleanup_session(stream_id: str):
